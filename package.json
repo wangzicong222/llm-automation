@@ -1,0 +1,65 @@
+{
+  "name": "llm-automation",
+  "version": "1.0.0",
+  "description": "Web UI automation using Playwright and LLM",
+  "main": "index.js",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test": "playwright test",
+    "test:ui": "playwright test --ui",
+    "test:headed": "playwright test --headed",
+    "test:debug": "playwright test --debug",
+    "install-browsers": "playwright install",
+    "codegen": "playwright codegen",
+    "llm:generate": "node scripts/llm-generator.js",
+    "llm:execute": "node scripts/llm-executor.js",
+    "test:api": "node scripts/test-api.js",
+    "testcase:process": "node scripts/test-case-to-ui-automation.js",
+    "testcase:parse": "node scripts/test-case-parser.js",
+    "testcase:generate": "node scripts/ui-automation-generator.js",
+    "testcase:execute": "node scripts/smart-ui-executor.js",
+    "deepseek:check": "node scripts/test-api.js",
+    "integrated:api": "node scripts/integrated-api-server.js",
+    "integrated:api:dev": "nodemon scripts/integrated-api-server.js",
+    "test:execution": "node scripts/test-execution-api.js",
+    "test:execution:dev": "nodemon scripts/test-execution-api.js",
+    "start:all": "node scripts/start-all-services.js"
+  },
+  "engines": {
+    "node": ">=18.0.0 <19"
+  },
+  "dependencies": {
+    "@vueuse/core": "^10.3.0",
+    "axios": "^1.5.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "form-data": "^4.0.4",
+    "langchain": "^0.0.200",
+    "multer": "^1.4.5-lts.1",
+    "pinia": "^2.1.6",
+    "vue": "^3.3.4",
+    "vue-router": "^4.2.4"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.38.1",
+    "@types/node": "^20.5.7",
+    "@vitejs/plugin-vue": "^4.3.4",
+    "@vue/eslint-config-typescript": "^12.0.0",
+    "eslint": "^8.48.0",
+    "eslint-plugin-vue": "^9.17.0",
+    "typescript": "^5.2.2",
+    "vite": "^4.4.9"
+  },
+  "keywords": [
+    "playwright",
+    "llm",
+    "automation",
+    "vue",
+    "testing"
+  ],
+  "author": "Your Name",
+  "license": "MIT"
+}
