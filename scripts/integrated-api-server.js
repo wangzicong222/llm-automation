@@ -186,6 +186,7 @@ function stripMarkdownAndComments(raw) {
   // 去除所有以"每个"、"都有"、"明确"等开头的行
   code = code.replace(/^(每个|都有|明确|步骤).*$/gm, '');
   
+  
   // 去除所有以"login.spec.ts"、"loginPage.ts"等开头的行
   code = code.replace(/^(login\.spec\.ts|loginPage\.ts).*$/gm, '');
   
