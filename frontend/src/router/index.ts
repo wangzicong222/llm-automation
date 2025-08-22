@@ -6,6 +6,8 @@ import FormsView from '../views/FormsView.vue'
 import TestDashboard from '../views/TestDashboard.vue'
 import IntegratedTestView from '../views/IntegratedTestView.vue'
 import TestExecutionView from '../views/TestExecutionView.vue'
+import CreateTestView from '../views/CreateTestView.vue'
+import TestReportView from '../views/TestReportView.vue'
 
 const router = createRouter({
   history: createWebHistory(),
@@ -13,22 +15,7 @@ const router = createRouter({
     {
       path: '/',
       name: 'home',
-      component: HomeView
-    },
-    {
-      path: '/login',
-      name: 'login',
-      component: LoginView
-    },
-    {
-      path: '/dashboard',
-      name: 'dashboard',
-      component: DashboardView
-    },
-    {
-      path: '/forms',
-      name: 'forms',
-      component: FormsView
+      redirect: '/test-dashboard'
     },
     {
       path: '/test-dashboard',
@@ -44,6 +31,16 @@ const router = createRouter({
       path: '/test-execution',
       name: 'test-execution',
       component: TestExecutionView
+    },
+    {
+      path: '/create-test',
+      name: 'create-test',
+      component: CreateTestView
+    },
+    {
+      path: '/test-report',
+      name: 'test-report',
+      component: TestReportView
     }
   ]
 })
