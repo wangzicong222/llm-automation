@@ -1,61 +1,117 @@
 <template>
   <div class="test-execution">
-    <div class="header">
-      <h1>🧪 测试执行与报告</h1>
-      <p>执行生成的测试用例并查看详细的测试报告</p>
-    </div>
+    <!-- 脚本列表区 -->
+    <div class="script-list-card">
+      <div class="list-header">
+        <h2>脚本管理</h2>
+        <div class="list-actions">
+          <button class="refresh-btn" @click="loadAvailableTestFiles">刷新</button>
+          <button class="new-btn" @click="openEditorForNew">新建脚本</button>
+        </div>
+      </div>
 
-    <!-- 测试执行控制面板 -->
-    <div class="execution-panel">
-      <div class="panel-header">
-        <h2>测试执行控制</h2>
+      <div class="run-options">
+        <label class="opt-item">
+          <input type="checkbox" v-model="visualMode" /> 可视化执行
+        </label>
+        <label class="opt-item">
+          慢速(ms)
+          <input class="opt-num" type="number" min="0" step="50" v-model.number="slowMs" placeholder="0" />
+        </label>
+      </div>
+
+      <!-- 顶部固定的执行进度条（更显眼的位置） -->
+      <div v-if="isExecuting" class="exec-sticky">
+        <div class="exec-row">
+          <div class="spinner" aria-label="executing" />
+          <div class="exec-text">
+            正在执行：<strong>{{ executingFile?.split('/').pop() }}</strong>
+          </div>
+        </div>
+        <div class="exec-bar"><div class="exec-bar-fill" /></div>
       </div>
       
-      <div class="execution-controls">
-        <!-- 测试文件选择 -->
-        <div class="control-group">
-          <label>选择测试文件：</label>
-          <select v-model="selectedTestFile" class="test-file-select">
-            <option value="">请选择测试文件</option>
-            <option v-for="file in availableTestFiles" :key="file" :value="file">
-              {{ file }}
-            </option>
-          </select>
+      <div class="stats-row">
+        <div class="kpi">
+          <div class="kpi-label">总脚本</div>
+          <div class="kpi-value">{{ filesWithMeta.length }}</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-label">执行中</div>
+          <div class="kpi-value">{{ isExecuting ? 1 : 0 }}</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-label">已完成</div>
+          <div class="kpi-value">{{ executedTests }}</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-label">报告</div>
+          <div class="kpi-value">-</div>
+        </div>
         </div>
 
-        <!-- 执行选项 -->
-        <div class="control-group">
-          <label>执行选项：</label>
-          <div class="execution-options">
-            <label class="option-label">
-              <input type="checkbox" v-model="executionOptions.headless" />
-              无头模式
-            </label>
-            <label class="option-label">
-              <input type="checkbox" v-model="executionOptions.parallel" />
-              并行执行
-            </label>
-            <label class="option-label">
-              <input type="checkbox" v-model="executionOptions.retry" />
-              失败重试
-            </label>
+      <div class="table-scroll" ref="tableScrollEl" :style="tableHeight > 0 ? { maxHeight: tableHeight + 'px' } : {}">
+        <div class="script-table">
+          <table>
+          <thead>
+            <tr>
+              <th style="width: 36px;">#</th>
+              <th>脚本信息</th>
+              <th>脚本描述</th>
+              <th style="width: 120px;">执行统计</th>
+              <th style="width: 180px;">更新时间</th>
+              <th style="width: 220px;">操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="(item, index) in pagedFiles" :key="item.path">
+              <td>{{ startIndex + index + 1 }}</td>
+              <td>
+                <div class="script-info">
+                  <span class="tag">playwright</span>
+                  <div class="name">{{ item.path.split('/').pop() }}</div>
+                  <div class="sub">{{ item.path }}</div>
+                  <div v-if="isExecuting && executingFile === item.path" class="inline-running">
+                    <span class="dot" /> 执行中...
+                  </div>
+                </div>
+              </td>
+              <td class="desc">{{ autoDesc(item.path) }}</td>
+              <td>{{ runCounts[item.path] || 0 }}</td>
+              <td>{{ formatTime(item.updatedAt) }}</td>
+              <td>
+                <div class="row-actions">
+                  <button class="link" @click="runFile(item.path)">执行</button>
+                  <button class="link" @click="openEditor(item.path)">编辑</button>
+                  <button class="link" @click="openReport()">报告</button>
+                  <button class="link danger" @click="deleteFile(item.path)">删除</button>
+                </div>
+              </td>
+            </tr>
+          </tbody>
+          </table>
           </div>
         </div>
 
-        <!-- 执行按钮 -->
-        <div class="execution-actions">
-          <button @click="executeTest" :disabled="!canExecute" class="execute-btn">
-            ▶️ 执行测试
-          </button>
-          <button @click="executeAllTests" class="execute-all-btn">
-            🚀 执行所有测试
-          </button>
-          <button @click="stopExecution" :disabled="!isExecuting" class="stop-btn">
-            ⏹️ 停止执行
-          </button>
+      <!-- 分页 -->
+      <div class="pagination-bar" v-if="totalItems > 0">
+        <div class="pagination-left">共 {{ totalItems }} 条</div>
+        <div class="pagination-right">
+          <label class="page-size">每页
+            <select v-model.number="pageSize">
+              <option :value="10">10</option>
+              <option :value="20">20</option>
+              <option :value="50">50</option>
+            </select> 条
+          </label>
+          <button class="page-btn" :disabled="currentPage === 1" @click="prevPage">上一页</button>
+          <span class="page-info">第 {{ currentPage }} / {{ totalPages }} 页</span>
+          <button class="page-btn" :disabled="currentPage === totalPages" @click="nextPage">下一页</button>
         </div>
       </div>
     </div>
+
+    
 
     <!-- 执行进度 -->
     <div v-if="isExecuting" class="execution-progress">
@@ -231,10 +287,53 @@
       </div>
     </div>
   </div>
+  
+  <!-- 编辑脚本模态框 -->
+  <div v-if="showEditor" class="modal-overlay" @click="() => { showEditor = false; disposeMonaco() }">
+    <div class="modal-content wide" @click.stop>
+      <div class="modal-header">
+        <h3>编辑脚本</h3>
+        <button @click="() => { showEditor = false; disposeMonaco() }" class="close-btn">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-grid">
+          <div class="form-group">
+            <label>脚本名称 *</label>
+            <input v-model="editorMeta.name" placeholder="请输入脚本名称" />
+          </div>
+          <div class="form-group">
+            <label>分类 *</label>
+            <input v-model="editorMeta.category" placeholder="功能测试/回归测试…" />
+          </div>
+          <div class="form-group">
+            <label>优先级 *</label>
+            <input v-model.number="editorMeta.priority" type="number" min="1" placeholder="1" />
+          </div>
+          <div class="form-group span-2">
+            <label>标签</label>
+            <input v-model="editorMeta.tags" placeholder="逗号分隔，如：登录,支付" />
+          </div>
+          <div class="form-group span-2">
+            <label>脚本内容（TypeScript）</label>
+            <div ref="monacoMountEl" class="code-area" />
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="page-btn" @click="showEditor = false">取消</button>
+        <button class="new-btn" @click="saveScript">保存</button>
+      </div>
+    </div>
+  </div>
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue'
+// @ts-ignore
+import loader from '@monaco-editor/loader'
+// 直接引入 monaco，避免 CDN 路径问题
+// @ts-ignore
+import * as monacoBundle from 'monaco-editor'
 
 // 响应式数据
 const selectedTestFile = ref('')
@@ -251,12 +350,32 @@ const showTestDetails = ref(false)
 const selectedTestDetail = ref<any>(null)
 
 // 可用测试文件
-const availableTestFiles = ref([
-  'tests/generated/login-test.spec.ts',
-  'tests/generated/user-management-test.spec.ts',
-  'tests/generated/waybill-test.spec.ts',
-  'tests/generated/finance-test.spec.ts'
-])
+type FileItem = { path: string; updatedAt: number; runs?: number }
+const filesWithMeta = ref<FileItem[]>([])
+const runCounts = ref<Record<string, number>>({})
+
+// 列表自适应高度（根据视窗与当前位置动态计算最大高度）
+const tableScrollEl = ref<HTMLElement | null>(null)
+const tableHeight = ref(0)
+const GAP_BOTTOM = 24 // 底部保留空白
+const computeTableHeight = () => {
+  try {
+    const top = tableScrollEl.value?.getBoundingClientRect().top || 0
+    const h = window.innerHeight - top - GAP_BOTTOM
+    tableHeight.value = h > 240 ? h : 240 // 保底高度
+  } catch {}
+}
+
+// 分页
+const currentPage = ref(1)
+const pageSize = ref(10)
+const totalItems = computed(() => filesWithMeta.value.length)
+const totalPages = computed(() => Math.max(1, Math.ceil(totalItems.value / pageSize.value)))
+const startIndex = computed(() => (currentPage.value - 1) * pageSize.value)
+const pagedFiles = computed(() => filesWithMeta.value.slice(startIndex.value, startIndex.value + pageSize.value))
+
+const prevPage = () => { if (currentPage.value > 1) currentPage.value-- }
+const nextPage = () => { if (currentPage.value < totalPages.value) currentPage.value++ }
 
 // 执行选项
 const executionOptions = ref({
@@ -264,10 +383,12 @@ const executionOptions = ref({
   parallel: false,
   retry: true
 })
+const visualMode = ref(true)
+const slowMs = ref(0)
 
 // 计算属性
 const canExecute = computed(() => {
-  return selectedTestFile.value || availableTestFiles.value.length > 0
+  return !!selectedTestFile.value || filesWithMeta.value.length > 0
 })
 
 const successRate = computed(() => {
@@ -310,45 +431,62 @@ const executeTest = async () => {
   }
 }
 
-const executeAllTests = async () => {
-  isExecuting.value = true
-  executionStatus.value = '开始执行所有测试...'
-  executionProgress.value = 0
-  executedTests.value = 0
-  passedTests.value = 0
-  failedTests.value = 0
-  
+async function mountMonaco() {
   try {
-    const response = await fetch('http://localhost:3002/api/execute-all-tests', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        options: executionOptions.value
-      })
+    if (!monacoMountEl.value) return
+    // 绑定到本地打包的 monaco，避免资源加载不到
+    loader.config({ monaco: monacoBundle })
+    const monaco = await loader.init()
+    monacoEditor = monaco.editor.create(monacoMountEl.value, {
+      value: editorContent.value,
+      language: 'typescript',
+      theme: 'vs-dark',
+      automaticLayout: true,
+      minimap: { enabled: false },
+      fontSize: 13,
+      scrollBeyondLastLine: false,
     })
-    
-    if (response.ok) {
-      const results = await response.json()
-      executionResults.value = results.results || []
-      updateExecutionStats()
-      generateTestReport()
-    } else {
-      throw new Error('执行失败')
+    // 若已有内容，确保同步到编辑器（双保险）
+    if (editorContent.value) {
+      monacoEditor.setValue(editorContent.value)
     }
-  } catch (error) {
-    console.error('执行所有测试失败:', error)
-    alert('执行失败，请重试')
+  } catch (e) {
+    console.error('初始化 Monaco 失败:', e)
+  }
+}
+
+function disposeMonaco() {
+  try {
+    if (monacoEditor && typeof monacoEditor.dispose === 'function') {
+      monacoEditor.dispose()
+    }
+    monacoEditor = null
+  } catch {}
+}
+
+// 运行指定文件的便捷方法
+const runFile = async (file: string) => {
+  selectedTestFile.value = file
+  executingFile.value = file
+  // 调用后端以 headed 模式执行
+  try {
+    isExecuting.value = true
+    await fetch('http://localhost:3002/api/execute-test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ testFile: file, options: { headed: visualMode.value } })
+    })
+    // 本地计数+1（简单统计）
+    const key = file
+    runCounts.value[key] = (runCounts.value[key] || 0) + 1
+  } catch (e) {
+    console.error('可视化执行失败:', e)
   } finally {
     isExecuting.value = false
   }
 }
 
-const stopExecution = () => {
-  isExecuting.value = false
-  executionStatus.value = '执行已停止'
-}
+// 已移除批量执行与停止逻辑（当需要时可恢复）
 
 const updateExecutionStats = () => {
   totalTests.value = executionResults.value.length
@@ -446,9 +584,114 @@ const shareReport = () => {
   }
 }
 
+// 打开「报告」占位
+const openReport = () => {
+  window.open('http://localhost:9323', '_blank')
+}
+
+// 简易编辑器逻辑
+const showEditor = ref(false)
+const editorFile = ref('')
+const editorContent = ref('')
+const executingFile = ref<string | null>(null)
+const editorMeta = ref<{ name?: string; category?: string; priority?: number; tags?: string }>({})
+// Monaco
+const monacoMountEl = ref<HTMLElement | null>(null)
+let monacoEditor: any = null
+
+const openEditor = async (file: string) => {
+  try {
+    const resp = await fetch(`http://localhost:3002/api/script?file=${encodeURIComponent(file)}`)
+    const data = await resp.json()
+    if (resp.ok && data.success) {
+      editorFile.value = file
+      editorContent.value = data.content
+      editorMeta.value = data.meta || {}
+      showEditor.value = true
+      await nextTick()
+      await mountMonaco()
+    } else {
+      console.error('读取脚本失败:', data)
+      alert(data.message || data.error || '读取脚本失败')
+    }
+  } catch (e) {
+    console.error('脚本读取异常:', e)
+    alert('读取脚本失败')
+  }
+}
+
+const openEditorForNew = () => {
+  editorFile.value = 'tests/generated/new-test.spec.ts'
+  editorContent.value = `import { test, expect } from '@playwright/test';\n\n test('示例', async ({ page }) => {\n   await page.goto('/');\n   await expect(page).toBeTruthy();\n });\n`
+  editorMeta.value = { name: '新脚本', category: '功能测试', priority: 1, tags: '' }
+  showEditor.value = true
+  nextTick().then(mountMonaco)
+}
+
+// 编辑器保存逻辑暂未接入界面，因此移除避免未使用告警
+
+const deleteFile = async (file: string) => {
+  if (!confirm(`确定删除脚本 ${file} 吗？`)) return
+  try {
+    const resp = await fetch(`http://localhost:3002/api/script?file=${encodeURIComponent(file)}`, { method: 'DELETE' })
+    const data = await resp.json()
+    if (data.success) {
+      await loadAvailableTestFiles()
+    } else {
+      alert(data.message || '删除失败')
+    }
+  } catch (e) {
+    alert('删除失败')
+  }
+}
+
+// 保存脚本
+const saveScript = async () => {
+  try {
+    const resp = await fetch('http://localhost:3002/api/script', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ file: editorFile.value, content: monacoEditor ? monacoEditor.getValue() : editorContent.value, meta: editorMeta.value })
+    })
+    const data = await resp.json()
+    if (data.success) {
+      showEditor.value = false
+      disposeMonaco()
+      await loadAvailableTestFiles()
+    } else {
+      alert(data.message || '保存失败')
+    }
+  } catch (e) {
+    alert('保存失败')
+  }
+}
+
+// 自动描述
+const autoDesc = (file: string): string => {
+  if (!file) return ''
+  const base = file.split('/').pop() || file
+  if (base.includes('login')) return '测试登录业务: 输入用户名和密码，验证登录成功'
+  if (base.includes('waybill')) return '运单相关测试用例'
+  if (base.includes('finance')) return '财务相关测试用例'
+  return '自动化测试脚本'
+}
+
+const formatTime = (ts: number): string => {
+  if (!ts) return '-'
+  const d = new Date(ts)
+  const pad = (n: number) => n.toString().padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
 onMounted(() => {
   // 初始化时加载可用的测试文件
   loadAvailableTestFiles()
+  computeTableHeight()
+  window.addEventListener('resize', computeTableHeight)
+})
+
+onUnmounted(() => {
+  window.removeEventListener('resize', computeTableHeight)
 })
 
 const loadAvailableTestFiles = async () => {
@@ -456,7 +699,11 @@ const loadAvailableTestFiles = async () => {
     const response = await fetch('http://localhost:3002/api/available-tests')
     if (response.ok) {
       const data = await response.json()
-      availableTestFiles.value = data.files || []
+      filesWithMeta.value = (data.files || []).map((x: any) => ({ path: x.path || x, updatedAt: x.updatedAt || Date.now(), runs: x.runs || 0 }))
+      // 合并到本地 runCounts
+      for (const item of filesWithMeta.value) {
+        runCounts.value[item.path] = item.runs || 0
+      }
     }
   } catch (error) {
     console.error('加载测试文件失败:', error)
@@ -466,125 +713,65 @@ const loadAvailableTestFiles = async () => {
 
 <style scoped>
 .test-execution {
-  max-width: 1200px;
-  margin: 0 auto;
-  padding: 2rem;
+  width: 100%;
+  margin: 0;
 }
 
-.header {
-  text-align: center;
-  margin-bottom: 3rem;
-}
-
-.header h1 {
-  color: #2c3e50;
-  margin-bottom: 0.5rem;
-}
-
-.header p {
-  color: #7f8c8d;
-  font-size: 1.1rem;
-}
-
-.execution-panel {
+.script-list-card {
   background: white;
   border-radius: 12px;
-  box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-  margin-bottom: 2rem;
-  overflow: hidden;
-}
-
-.panel-header {
-  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-  color: white;
-  padding: 1.5rem 2rem;
-}
-
-.panel-header h2 {
-  margin: 0;
-  font-size: 1.5rem;
-}
-
-.execution-controls {
-  padding: 2rem;
-}
-
-.control-group {
+  padding: 1.5rem 1.5rem 0.5rem;
+  box-shadow: 0 4px 6px rgba(0, 0, 0, 0.06);
   margin-bottom: 1.5rem;
 }
 
-.control-group label {
-  display: block;
-  margin-bottom: 0.5rem;
-  font-weight: 600;
-  color: #2c3e50;
-}
+.list-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem; }
+.list-header h2 { margin: 0; font-size: 1.2rem; }
+.list-actions { display: flex; gap: .5rem; }
+.refresh-btn, .new-btn { border: none; background: #f1f5f9; padding: .5rem .8rem; border-radius: 6px; cursor: pointer; }
+.new-btn { background: #3b82f6; color: white; }
 
-.test-file-select {
-  width: 100%;
-  padding: 0.75rem;
-  border: 1px solid #ddd;
-  border-radius: 6px;
-  font-size: 1rem;
-}
+.run-options { display: flex; align-items: center; gap: 1rem; margin: .5rem 0 1rem; }
+.opt-item { display: inline-flex; align-items: center; gap: .5rem; color: #475569; }
+.opt-num { width: 90px; padding: .35rem .5rem; border: 1px solid #e5e7eb; border-radius: 6px; }
 
-.execution-options {
-  display: flex;
-  gap: 2rem;
-  flex-wrap: wrap;
-}
+.stats-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: .75rem; margin-bottom: 1rem; }
+.kpi { background: #f8fafc; border: 1px solid #eef2f7; border-radius: 8px; padding: .75rem; }
+.kpi-label { color: #64748b; font-size: .85rem; }
+.kpi-value { font-weight: 700; color: #111827; font-size: 1.25rem; }
 
-.option-label {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  cursor: pointer;
-}
+.table-scroll { max-height: 55vh; overflow: auto; border: 1px solid #eef2f7; border-radius: 8px; }
+.script-table { overflow-x: auto; }
+.script-table table { width: 100%; border-collapse: collapse; }
+.script-table th, .script-table td { padding: .75rem; border-bottom: 1px solid #eef2f7; text-align: left; }
+.tag { display: inline-block; background: #eef2ff; color: #4f46e5; padding: 2px 8px; border-radius: 12px; font-size: .75rem; margin-right: .5rem; }
+.script-info .name { font-weight: 600; color: #111827; }
+.script-info .sub { color: #64748b; font-size: .85rem; }
+.desc { color: #6b7280; }
+.row-actions { display: flex; gap: .5rem; }
+.row-actions .link { background: none; border: none; color: #2563eb; cursor: pointer; padding: 0; }
+.row-actions .danger { color: #dc2626; }
 
-.execution-actions {
-  display: flex;
-  gap: 1rem;
-  margin-top: 2rem;
-}
+.exec-sticky { position: sticky; top: 0; z-index: 5; background: #f8fafc; padding: .75rem 0; border-bottom: 1px solid #e5e7eb; margin-bottom: .5rem; }
+.exec-row { display: flex; align-items: center; gap: .5rem; margin-bottom: .5rem; }
+.spinner { width: 14px; height: 14px; border: 2px solid #93c5fd; border-top-color: transparent; border-radius: 50%; animation: spin 1s linear infinite; }
+.exec-text { color: #374151; font-size: .9rem; }
+.exec-bar { width: 100%; height: 6px; background: #e5e7eb; border-radius: 6px; overflow: hidden; }
+.exec-bar-fill { width: 40%; height: 100%; background: linear-gradient(90deg,#60a5fa,#3b82f6); animation: progress 1.4s ease-in-out infinite; }
+@keyframes progress { 0% { transform: translateX(-40%);} 50% { transform: translateX(20%);} 100% { transform: translateX(100%);} }
+@keyframes spin { to { transform: rotate(360deg);} }
 
-.execute-btn,
-.execute-all-btn,
-.stop-btn {
-  padding: 0.75rem 1.5rem;
-  border: none;
-  border-radius: 6px;
-  font-weight: 600;
-  cursor: pointer;
-  transition: all 0.3s ease;
-}
+.inline-running { display: inline-flex; align-items: center; gap: 6px; color: #2563eb; font-size: .85rem; margin-top: .25rem; }
+.inline-running .dot { width: 6px; height: 6px; background: #2563eb; border-radius: 50%; animation: blink 1s ease-in-out infinite; }
+@keyframes blink { 0%,100% { opacity: .2 } 50% { opacity: 1 } }
 
-.execute-btn {
-  background: #27ae60;
-  color: white;
-}
+.pagination-bar { display: flex; justify-content: space-between; align-items: center; padding: 1rem 0; }
+.pagination-right { display: flex; align-items: center; gap: .75rem; }
+.page-btn { border: 1px solid #e5e7eb; background: #fff; padding: .35rem .8rem; border-radius: 6px; cursor: pointer; }
+.page-btn:disabled { opacity: .5; cursor: not-allowed; }
+.page-size select { margin: 0 .25rem; }
 
-.execute-all-btn {
-  background: #3498db;
-  color: white;
-}
 
-.stop-btn {
-  background: #e74c3c;
-  color: white;
-}
-
-.execute-btn:hover:not(:disabled),
-.execute-all-btn:hover,
-.stop-btn:hover:not(:disabled) {
-  transform: translateY(-1px);
-  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
-}
-
-.execute-btn:disabled,
-.stop-btn:disabled {
-  opacity: 0.6;
-  cursor: not-allowed;
-}
 
 .execution-progress {
   background: white;
@@ -948,9 +1135,14 @@ const loadAvailableTestFiles = async () => {
   border-radius: 12px;
   max-width: 800px;
   max-height: 80vh;
-  overflow-y: auto;
+  /* 让 body 来滚动，header/footer 固定 */
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
   margin: 2rem;
 }
+
+.modal-content.wide { max-width: 1000px; width: 90%; }
 
 .modal-header {
   display: flex;
@@ -975,7 +1167,18 @@ const loadAvailableTestFiles = async () => {
 
 .modal-body {
   padding: 2rem;
+  flex: 1;
+  overflow: auto;
+  min-height: 0; /* 关键：允许子滚动容器在 flex 中正确计算高度 */
 }
+
+.form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem 1.5rem; }
+.form-group { display: flex; flex-direction: column; }
+.form-group label { margin-bottom: .4rem; color: #374151; font-weight: 600; }
+.form-group input { padding: .6rem .75rem; border: 1px solid #e5e7eb; border-radius: 6px; font-size: .95rem; }
+.form-group.span-2 { grid-column: span 2; }
+.code-area { width: 100%; min-height: 360px; font-family: ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace; background: #0b1220; color: #e5e7eb; border-radius: 8px; padding: 12px; border: 1px solid #1f2937; }
+.modal-footer { display: flex; justify-content: flex-end; gap: .75rem; padding: 0 2rem 1.5rem; }
 
 .detail-section {
   margin-bottom: 2rem;
@@ -1009,7 +1212,7 @@ const loadAvailableTestFiles = async () => {
 
 @media (max-width: 768px) {
   .test-execution {
-    padding: 1rem;
+    padding: 0.5rem;
   }
   
   .execution-actions {

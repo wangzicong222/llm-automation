@@ -41,12 +41,15 @@ class LLMTestExecutor {
 
   async runPlaywrightTest(testFile) {
     return new Promise((resolve, reject) => {
-      // 修改命令：同时生成JSON和HTML报告
-      const command = `npx playwright test "${testFile}" --reporter=json,html`;
+      // 支持 headed/slowMo 通过环境变量或进程参数控制
+      const headed = process.env.PW_HEADED === 'true' ? '--headed' : '';
+      const slowMo = process.env.PW_SLOWMO ? `--project="chromium"` : '';
+      // 生成JSON和HTML报告；若传 PW_HEADED=true 则可视化执行
+      const command = `npx playwright test "${testFile}" --reporter=json,html ${headed}`.trim();
       
       console.log(`📋 执行命令: ${command}`);
       
-      exec(command, { cwd: process.cwd() }, (error, stdout, stderr) => {
+      exec(command, { cwd: process.cwd(), env: { ...process.env } }, (error, stdout, stderr) => {
         if (error) {
           console.error('❌ 测试执行失败:', error.message);
           resolve({

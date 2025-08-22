@@ -16,16 +16,70 @@ app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 // 测试执行器实例
 const testExecutor = new LLMTestExecutor();
 
+// 运行统计 - 持久化到文件
+const RUN_COUNT_FILE = path.join(__dirname, '../test-results/run-counts.json');
+let RUN_COUNTS = {};
+
+async function loadRunCounts() {
+  try {
+    const data = await fs.readFile(RUN_COUNT_FILE, 'utf8');
+    RUN_COUNTS = JSON.parse(data || '{}');
+  } catch (e) {
+    RUN_COUNTS = {};
+  }
+}
+
+async function saveRunCounts() {
+  try {
+    const dir = path.dirname(RUN_COUNT_FILE);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(RUN_COUNT_FILE, JSON.stringify(RUN_COUNTS, null, 2));
+  } catch (e) {
+    console.warn('保存运行统计失败:', e.message);
+  }
+}
+
+// 初始化加载统计
+loadRunCounts();
+
+// 安全解析测试文件路径，限制在 tests/generated 目录
+function resolveTestFilePath(relativeFile) {
+  const testsDir = path.join(__dirname, '../tests/generated');
+  const normalized = path.normalize(relativeFile || '');
+  const fullPath = path.join(__dirname, '..', normalized.startsWith('tests/') ? normalized : path.join('tests/generated', normalized));
+  if (!fullPath.startsWith(path.join(__dirname, '..'))) {
+    throw new Error('非法路径');
+  }
+  if (!fullPath.startsWith(testsDir)) {
+    throw new Error('仅允许访问 tests/generated 目录下的文件');
+  }
+  return { fullPath, testsDir };
+}
+
 // 获取可用的测试文件
 app.get('/api/available-tests', async (req, res) => {
   try {
     const testsDir = path.join(__dirname, '../tests/generated');
     const files = await fs.readdir(testsDir);
     const testFiles = files.filter(file => file.endsWith('.spec.ts'));
-    
+
+    const items = await Promise.all(
+      testFiles.map(async (file) => {
+        const fullPath = path.join(testsDir, file);
+        let stats;
+        try {
+          stats = await fs.stat(fullPath);
+        } catch {
+          stats = { mtimeMs: Date.now() };
+        }
+        const p = `tests/generated/${file}`;
+        return { path: p, updatedAt: stats.mtimeMs, runs: RUN_COUNTS[p] || 0 };
+      })
+    );
+
     res.json({
       success: true,
-      files: testFiles.map(file => `tests/generated/${file}`)
+      files: items
     });
   } catch (error) {
     console.error('获取测试文件失败:', error);
@@ -34,6 +88,91 @@ app.get('/api/available-tests', async (req, res) => {
       message: '获取测试文件失败',
       error: error.message
     });
+  }
+});
+
+// 获取运行统计
+app.get('/api/run-counts', async (req, res) => {
+  try {
+    await loadRunCounts();
+    res.json({ success: true, counts: RUN_COUNTS });
+  } catch (e) {
+    res.status(500).json({ success: false, message: '获取运行统计失败' });
+  }
+});
+
+// 读取脚本内容
+app.get('/api/script', async (req, res) => {
+  try {
+    const { file } = req.query;
+    if (!file) {
+      return res.status(400).json({ success: false, message: '缺少参数 file' });
+    }
+    const { fullPath, testsDir } = resolveTestFilePath(file);
+    let content;
+    try {
+      content = await fs.readFile(fullPath, 'utf8');
+    } catch (err) {
+      // 兜底：仅用文件名在 tests/generated 下再尝试一次（防止路径前缀不一致）
+      try {
+        const alt = path.join(testsDir, path.basename(file));
+        content = await fs.readFile(alt, 'utf8');
+      } catch (err2) {
+        console.error('读取脚本失败: ', fullPath, err2.message);
+        return res.status(404).json({ success: false, message: '读取脚本失败', error: err2.message, file });
+      }
+    }
+    let meta = {};
+    try {
+      const metaPath = `${fullPath}.meta.json`;
+      const metaRaw = await fs.readFile(metaPath, 'utf8');
+      meta = JSON.parse(metaRaw || '{}');
+    } catch (_) {}
+    res.json({ success: true, file, content, meta });
+  } catch (error) {
+    console.error('读取脚本失败:', error);
+    res.status(500).json({ success: false, message: '读取脚本失败', error: error.message });
+  }
+});
+
+// 保存脚本内容
+app.post('/api/script', async (req, res) => {
+  try {
+    const { file, content, meta } = req.body || {};
+    if (!file || typeof content !== 'string') {
+      return res.status(400).json({ success: false, message: '参数错误：需要 file 与 content' });
+    }
+    const { fullPath, testsDir } = resolveTestFilePath(file);
+    await fs.mkdir(testsDir, { recursive: true });
+    await fs.writeFile(fullPath, content, 'utf8');
+    if (meta && typeof meta === 'object') {
+      try {
+        const metaPath = `${fullPath}.meta.json`;
+        await fs.writeFile(metaPath, JSON.stringify(meta, null, 2), 'utf8');
+      } catch (e) {
+        console.warn('写入脚本元数据失败:', e.message);
+      }
+    }
+    res.json({ success: true, file });
+  } catch (error) {
+    console.error('保存脚本失败:', error);
+    res.status(500).json({ success: false, message: '保存脚本失败', error: error.message });
+  }
+});
+
+// 删除脚本
+app.delete('/api/script', async (req, res) => {
+  try {
+    const { file } = req.query;
+    if (!file) {
+      return res.status(400).json({ success: false, message: '缺少参数 file' });
+    }
+    const { fullPath } = resolveTestFilePath(file);
+    await fs.unlink(fullPath);
+    res.json({ success: true, file });
+  } catch (error) {
+    console.error('删除脚本失败:', error);
+    res.status(500).json({ success: false, message: '删除脚本失败', error: error.message });
   }
 });
 
@@ -52,7 +191,16 @@ app.post('/api/execute-test', async (req, res) => {
     console.log(`开始执行测试: ${testFile}`);
     
     const startTime = Date.now();
+    // 允许前端开启 headed 模式
+    if (options && options.headed) {
+      process.env.PW_HEADED = 'true';
+    } else {
+      delete process.env.PW_HEADED;
+    }
     const result = await testExecutor.executeTest(testFile);
+    // 统计 +1 并保存
+    RUN_COUNTS[testFile] = (RUN_COUNTS[testFile] || 0) + 1;
+    await saveRunCounts();
     const duration = Date.now() - startTime;
     
     // 新增：执行测试后，重新生成HTML报告
