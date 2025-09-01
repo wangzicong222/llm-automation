@@ -224,51 +224,18 @@ const dateFilter = ref('')
 const currentPage = ref(1)
 const selectedReport = ref<TestReport | null>(null)
 
-const reports = ref<TestReport[]>([
-  {
-    id: '001',
-    name: '登录功能测试',
-    testSuite: '用户认证',
-    executionTime: new Date('2025-01-20T10:30:00'),
-    status: 'success',
-    totalTests: 15,
-    passedTests: 15,
-    failedTests: 0,
-    successRate: 100,
-    tests: [
-      { id: '1', name: '正确用户名密码登录', status: 'success', duration: 1200 },
-      { id: '2', name: '错误密码登录', status: 'success', duration: 800 },
-      { id: '3', name: '验证码验证', status: 'success', duration: 1500 }
-    ]
-  },
-  {
-    id: '002',
-    name: '订单管理测试',
-    testSuite: '业务流程',
-    executionTime: new Date('2025-01-20T09:15:00'),
-    status: 'failure',
-    totalTests: 20,
-    passedTests: 18,
-    failedTests: 2,
-    successRate: 90,
-    tests: [
-      { id: '1', name: '创建订单', status: 'success', duration: 2000 },
-      { id: '2', name: '修改订单', status: 'success', duration: 1800 },
-      { id: '3', name: '删除订单', status: 'failure', duration: 500, error: '权限不足' }
-    ]
-  }
-])
+const reports = ref<TestReport[]>([])
 
 const reportStats = computed(() => {
-  const total = reports.value.length
-  const passed = reports.value.filter(r => r.status === 'success').length
-  const failed = reports.value.filter(r => r.status === 'failure').length
-  const successRate = total > 0 ? Math.round((passed / total) * 100) : 0
-  
+  const totalTests = reports.value.reduce((sum, r) => sum + (r.totalTests || 0), 0)
+  const passedTests = reports.value.reduce((sum, r) => sum + (r.passedTests || 0), 0)
+  const failedTests = reports.value.reduce((sum, r) => sum + (r.failedTests || 0), 0)
+  const successRate = totalTests > 0 ? Math.round((passedTests / totalTests) * 100) : 0
+
   return {
-    totalTests: reports.value.reduce((sum, r) => sum + r.totalTests, 0),
-    passedTests: reports.value.reduce((sum, r) => sum + r.passedTests, 0),
-    failedTests: reports.value.reduce((sum, r) => sum + r.failedTests, 0),
+    totalTests,
+    passedTests,
+    failedTests,
     successRate
   }
 })
@@ -370,9 +337,34 @@ function getStatusText(status: string): string {
   return statusMap[status] || status
 }
 
-onMounted(() => {
-  // 可以在这里加载真实的报告数据
-  console.log('测试报告页面已加载')
+onMounted(async () => {
+  try {
+    const resp = await fetch('http://localhost:3002/api/reports')
+    if (resp.ok) {
+      const data = await resp.json()
+      const list = (data.reports || []).map((r: any, idx: number) => ({
+        id: r.id || String(idx + 1),
+        name: r.name || '未命名报告',
+        testSuite: r.testSuite || '-',
+        executionTime: r.executionTime ? new Date(r.executionTime) : new Date(),
+        status: r.status || 'success',
+        totalTests: r.totalTests || 0,
+        passedTests: r.passedTests || 0,
+        failedTests: r.failedTests || 0,
+        successRate: r.successRate || 0,
+        tests: (r.tests || []).map((t: any, i: number) => ({
+          id: t.id || String(i + 1),
+          name: t.name || '-',
+          status: t.status || 'success',
+          duration: t.duration || 0,
+          error: t.error
+        }))
+      }))
+      reports.value = list
+    }
+  } catch (e) {
+    console.error('加载报告失败', e)
+  }
 })
 </script>
 
