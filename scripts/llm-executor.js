@@ -44,8 +44,9 @@ class LLMTestExecutor {
       // 支持 headed/slowMo 通过环境变量或进程参数控制
       const headed = process.env.PW_HEADED === 'true' ? '--headed' : '';
       const slowMo = process.env.PW_SLOWMO ? `--project="chromium"` : '';
-      // 生成JSON和HTML报告；若传 PW_HEADED=true 则可视化执行
-      const command = `npx playwright test "${testFile}" --reporter=json,html ${headed}`.trim();
+      // 使用项目内的 playwright.config.ts 中的 reporter 配置（包含 json/html/junit）
+      // 这里不再覆盖 --reporter，避免丢失 json 输出文件（test-results/results.json）
+      const command = `npx playwright test "${testFile}" ${headed}`.trim();
       
       console.log(`📋 执行命令: ${command}`);
       

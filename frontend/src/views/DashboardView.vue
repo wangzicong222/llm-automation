@@ -127,43 +127,9 @@ import { useRouter } from 'vue-router'
 const router = useRouter()
 
 const username = ref('')
-const stats = ref({
-  totalTests: 156,
-  passedTests: 142,
-  failedTests: 14,
-  executionTime: 45
-})
+const stats = ref({ totalTests: 0, passedTests: 0, failedTests: 0, executionTime: 0 })
 
-const recentTests = ref([
-  {
-    id: 1,
-    name: '用户登录测试',
-    description: '验证用户登录功能',
-    status: 'passed',
-    time: '2.3s'
-  },
-  {
-    id: 2,
-    name: '表单提交测试',
-    description: '验证表单数据提交',
-    status: 'passed',
-    time: '1.8s'
-  },
-  {
-    id: 3,
-    name: '数据验证测试',
-    description: '验证输入数据验证',
-    status: 'failed',
-    time: '3.1s'
-  },
-  {
-    id: 4,
-    name: '响应式布局测试',
-    description: '验证移动端适配',
-    status: 'passed',
-    time: '4.2s'
-  }
-])
+const recentTests = ref<any[]>([])
 
 const coverage = ref({
   ui: 85,
@@ -171,12 +137,46 @@ const coverage = ref({
   validation: 78
 })
 
-onMounted(() => {
+onMounted(async () => {
   const storedUsername = localStorage.getItem('username')
   if (storedUsername) {
     username.value = storedUsername
   } else {
     router.push('/login')
+  }
+
+  // 拉取真实报告数据
+  try {
+    const resp = await fetch('http://localhost:3002/api/reports')
+    const data = await resp.json()
+    if (resp.ok && data.success && Array.isArray(data.reports) && data.reports.length > 0) {
+      const report = data.reports[0]
+      // 统计概览
+      const total = Number(report.totalTests ?? report.total ?? 0)
+      const passed = Number(report.passedTests ?? report.passed ?? 0)
+      const failed = Number(report.failedTests ?? report.failed ?? Math.max(0, total - passed))
+      // 累计耗时（ms -> s）
+      const totalDurationMs = Array.isArray(report.tests) ? report.tests.reduce((acc: number, t: any) => acc + Number(t.duration || 0), 0) : 0
+      stats.value = {
+        totalTests: total,
+        passedTests: passed,
+        failedTests: failed,
+        executionTime: Math.round(totalDurationMs / 1000)
+      }
+
+      // 最近活动
+      if (Array.isArray(report.tests)) {
+        recentTests.value = report.tests.slice(0, 10).map((t: any, idx: number) => ({
+          id: t.id || idx + 1,
+          name: t.name || (t.testFile || `用例-${idx + 1}`),
+          description: t.error ? (typeof t.error === 'string' ? t.error : '执行失败') : '执行成功',
+          status: t.status === 'success' || t.success ? 'passed' : 'failed',
+          time: formatMs(t.duration)
+        }))
+      }
+    }
+  } catch (e) {
+    console.warn('读取报告失败，将使用默认占位数据')
   }
 })
 
@@ -215,6 +215,14 @@ const openSettings = () => {
 const executeTests = () => {
   // 跳转到测试执行页面
   router.push('/test-execution')
+}
+
+function formatMs(ms: any) {
+  const n = Number(ms || 0)
+  if (!isFinite(n) || n <= 0) return '-'
+  if (n < 1000) return `${n}ms`
+  const s = n / 1000
+  return `${s.toFixed(s < 10 ? 1 : 0)}s`
 }
 </script>
 

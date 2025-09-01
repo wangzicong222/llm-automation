@@ -12,6 +12,8 @@ const PORT = 3002;
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+// 为了简单的SSE解析，关闭express默认缓存
+app.set('x-powered-by', false);
 
 // 测试执行器实例
 const testExecutor = new LLMTestExecutor();
@@ -41,6 +43,436 @@ async function saveRunCounts() {
 
 // 初始化加载统计
 loadRunCounts();
+
+// 解析 Playwright JSON 报告（容错）
+async function parsePlaywrightJsonReport(jsonPath) {
+  try {
+    const raw = await fs.readFile(jsonPath, 'utf8');
+    const data = JSON.parse(raw || '{}');
+    const tests = [];
+    function collect(node) {
+      if (!node) return;
+      if (Array.isArray(node)) { node.forEach(collect); return; }
+      if (typeof node !== 'object') return;
+
+      const title = node.titlePath ? node.titlePath.join(' > ') : node.title;
+      const outcome = node.outcome || node.status;
+      const ok = typeof node.ok === 'boolean' ? node.ok : undefined;
+      if (title && (outcome !== undefined || ok !== undefined)) {
+        let isSuccess;
+        if (ok !== undefined) {
+          isSuccess = !!ok;
+        } else {
+          const o = String(outcome).toLowerCase();
+          isSuccess = ['passed', 'expected', 'ok', 'success'].includes(o);
+        }
+        const isFailure = !isSuccess;
+        tests.push({
+          id: String(tests.length + 1),
+          name: title,
+          status: isFailure ? 'failure' : 'success',
+          duration: node.duration || 0,
+          error: node.error ? (node.error.message || String(node.error)) : undefined,
+        });
+      }
+      for (const v of Object.values(node)) collect(v);
+    }
+    collect(data);
+    const total = tests.length;
+    const passed = tests.filter(x => x.status === 'success').length;
+    const failed = total - passed;
+    return {
+      id: `pw-${Date.now()}`,
+      name: 'Playwright JSON 报告',
+      testSuite: '转换自 results.json',
+      executionTime: new Date().toISOString(),
+      status: failed === 0 ? 'success' : 'failure',
+      totalTests: total,
+      passedTests: passed,
+      failedTests: failed,
+      successRate: total > 0 ? Math.round((passed / total) * 100) : 0,
+      tests,
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
+// 解析 Markdown 用例为结构化对象
+function parseMarkdownTestCases(markdown) {
+  if (!markdown || typeof markdown !== 'string') return [];
+  console.log('🔍 开始解析Markdown，长度:', markdown.length);
+  const lines = markdown.split(/\r?\n/);
+  console.log('🔍 分割后的行数:', lines.length);
+  const cases = [];
+  let current = null;
+  let mode = null; // 'steps' | 'expects' | null
+
+  const pushCurrent = () => {
+    if (current) {
+      cases.push(current);
+      current = null;
+      mode = null;
+    }
+  };
+
+  for (const raw of lines) {
+    // 预清洗：去掉 Markdown 粗体/行内代码等轻量标记，统一全角冒号
+    let line = raw.trim();
+    line = line.replace(/\*\*(.*?)\*\*/g, '$1'); // **粗体** → 文本
+    line = line.replace(/\`([^`]*)\`/g, '$1');     // `行内代码` → 文本
+    line = line.replace(/[：:]\s*$/g, '：');        // 结尾统一成全角冒号
+    line = line.replace(/^\s*[•·]\s*/g, '- ');      // • / · 前缀 → -
+    if (!line) { mode = null; continue; }
+    
+    console.log('🔍 处理行:', line, '当前模式:', mode);
+
+    // 分段标题（多模式）
+    const titleMatchers = [
+      /^##\s*测试用例\s*\d+[:：]\s*(.*)$/,
+      /^###?\s*(用例|案例|Case|Test)[:：]\s*(.*)$/i,
+      /^(用例|案例|Case|Test)[:：]\s*(.*)$/i,
+    ];
+    let titleMatched = null;
+    for (const re of titleMatchers) {
+      const m = line.match(re);
+      if (m) { titleMatched = m[m.length - 1]; break; }
+    }
+    if (titleMatched !== null) {
+      pushCurrent();
+      current = { title: titleMatched || '未命名用例', steps: [], expects: [] };
+      continue;
+    }
+
+    // 分隔线作为新用例分段（--- 或 ===）
+    if (/^[-=_]{3,}$/.test(line)) { pushCurrent(); continue; }
+
+      // 区块标识
+  if (/^步(骤|驟)[:：]$/i.test(line)) { mode = 'steps'; continue; }
+  if (/^(预期|期望|Expected)[:：]?$/i.test(line)) { mode = 'expects'; continue; }
+  
+  // 新增：识别"预期结果:"格式
+  if (/^预期结果[:：]?$/i.test(line)) { mode = 'expects'; continue; }
+
+    // 可选标题行：标题：xxx
+    const mTitle = line.match(/^(标题|Title)[:：]\s*(.*)$/i);
+    if (mTitle) {
+      if (!current) current = { title: '', steps: [], expects: [] };
+      current.title = mTitle[2] || current.title || '未命名用例';
+      continue;
+    }
+
+    if (!current) { current = { title: '未命名用例', steps: [], expects: [] }; }
+
+    // 步骤：有数字或短横线或处于 steps 模式
+    const stepByNumber = line.match(/^\d+[\.)]\s*(.*)$/);
+    const stepByDash = line.match(/^[-•]\s*(.*)$/);
+    if (mode === 'steps' && (stepByNumber || stepByDash)) {
+      current.steps.push((stepByNumber ? stepByNumber[1] : stepByDash[1]).trim());
+      continue;
+    }
+    if (stepByNumber) { current.steps.push(stepByNumber[1].trim()); continue; }
+    
+    // 新增：处理没有空格的数字步骤格式（如"1.进入页面"）
+    const stepByNumberNoSpace = line.match(/^(\d+[\.)])(.+)$/);
+    if (stepByNumberNoSpace) {
+      current.steps.push(stepByNumberNoSpace[2].trim());
+      continue;
+    }
+    
+    // 新增：处理"1. 步骤"格式（数字+点+空格+步骤）
+    const stepByNumberWithSpace = line.match(/^\d+[\.)]\s+(.+)$/);
+    if (stepByNumberWithSpace) {
+      current.steps.push(stepByNumberWithSpace[1].trim());
+      continue;
+    }
+
+    // 预期：短横线/圆点或处于 expects 模式
+    const expectByDash = line.match(/^[-•]\s*(.*)$/);
+    if (mode === 'expects' && expectByDash) { current.expects.push(expectByDash[1].trim()); continue; }
+    if (!mode && expectByDash && /应|显示|选中|成功|失败|提示|可见|包含|等于|相等/.test(expectByDash[1])) {
+      // 未显式进入 expects，但看起来像预期
+      current.expects.push(expectByDash[1].trim());
+      continue;
+    }
+
+    // 回退：无模式时按步骤处理
+    if (!mode && stepByDash) { current.steps.push(stepByDash[1].trim()); continue; }
+  }
+  pushCurrent();
+  return cases.filter(c => (c.title && c.title.trim()) || c.steps.length > 0 || c.expects.length > 0);
+}
+
+// 将中文步骤映射为可执行代码（启发式）
+function mapStepToCode(step, ruleSummary) {
+  if (!step) return null;
+  const s = step.trim();
+  // 以“验证/校验”开头的步骤，转由预期规则处理
+  if (/^(验证|校验)/.test(s)) {
+    const mapped = mapExpectToCode(s.replace(/^(验证|校验)/, ''), ruleSummary);
+    if (mapped) {
+      ruleSummary.steps.push({ text: s, rule: 'mapped-to-expect', hit: true });
+      // 直接返回断言代码，而不是让上层回退生成注释
+      return mapped;
+    }
+  }
+  // 导航类
+  if (/进入|打开/.test(s) && /页面/.test(s)) {
+    ruleSummary.steps.push({ text: s, rule: 'navigate-page', hit: true });
+    return `// 已在测试内置跳转至页面`;
+  }
+  
+  // 新增：处理"进入押金管理页面"这种格式
+  if (/进入.*管理页面/.test(s)) {
+    ruleSummary.steps.push({ text: s, rule: 'navigate-management-page', hit: true });
+    return `// 已在测试内置跳转至页面`;
+  }
+  // 点击按钮
+  const clickBtn = s.match(/点击[“"']?(.+?)[”"']?按钮/);
+  if (clickBtn) {
+    const name = clickBtn[1];
+    ruleSummary.steps.push({ text: s, rule: 'click-button-by-name', hit: true });
+    return `await page.getByRole('button', { name: '${name}' }).click();`;
+  }
+  // 点击"确定/取消/X"
+  if (/点击["']?确定["']?/.test(s)) { ruleSummary.steps.push({ text: s, rule: 'click-confirm', hit: true }); return `await page.getByRole('button', { name: /^(确定|确认|保 存|保存)$/ }).click();`; }
+  if (/点击[""']?取消[""']?/.test(s)) { ruleSummary.steps.push({ text: s, rule: 'click-cancel', hit: true }); return `await page.getByRole('button', { name: '取消' }).click();`; }
+  if (/右上角.*["']?X[""']?/.test(s)) return `await page.locator('.ant-modal-close').click();`;
+  // 勾选/选择某个选项（通用，适配 radio/checkbox/label）
+  const chooseOpt = s.match(/(勾选|选择|点击)["'](.+?)["']/);
+  if (chooseOpt) {
+    const label = chooseOpt[2];
+    ruleSummary.steps.push({ text: s, rule: 'choose-option-by-label', hit: true });
+    return `await page.locator('.ant-modal-content').locator('label:has-text("${label}"), .ant-radio-wrapper:has-text("${label}"), .ant-checkbox-wrapper:has-text("${label}")').first().click();`;
+  }
+  // 文本输入：如 "在XXX中输入'YYY'" 或 "输入'YYY'到XXX"
+  const inputToField = s.match(/(在|向)?([\u4e00-\u9fa5A-Za-z0-9_\s"'']+?)(输入框|文本框|输入栏|字段|中|里)?(输入|填写)["'](.+?)["']/);
+  const fillValueFirst = s.match(/(输入|填写)["'](.+?)[""'].*(到|至|到达|在)(.+?)(中|里)?$/);
+  if (inputToField || fillValueFirst) {
+    const labelText = (inputToField ? inputToField[2] : (fillValueFirst ? fillValueFirst[4] : '')).replace(/["']/g, '').trim();
+    const value = (inputToField ? inputToField[5] : (fillValueFirst ? fillValueFirst[2] : '')) || '';
+    const v = value || '示例文本';
+    ruleSummary.steps.push({ text: s, rule: 'fill-input-by-label', hit: true });
+    return (
+      `{\n` +
+      `  const targetInput = page.locator('.ant-modal-content .ant-form-item:has(label:has-text("${labelText}"))').locator('input:not([type="hidden"]), textarea').first();\n` +
+      `  await targetInput.scrollIntoViewIfNeeded();\n` +
+      `  await targetInput.click();\n` +
+      `  await targetInput.fill('');\n` +
+      `  await targetInput.type(${JSON.stringify(value || '示例文本')}, { delay: 10 });\n` +
+      `}`
+    );
+  }
+  // 打开/展开"新增/新建/创建"之类的弹窗/面板（通用）
+  if (/(打开|展开|新建|新增|创建).*["'](.+?)["']?/.test(s)) {
+    const m = s.match(/["'](.+?)["']/)
+    const btn = m ? m[1] : null
+    if (btn) { ruleSummary.steps.push({ text: s, rule: 'open-by-button', hit: true }); return `await page.getByRole('button', { name: '${btn}' }).first().click();` }
+  }
+
+  // 下拉选择：在XXX下拉中选择"YYY"/选择下拉"YYY"/选择"YYY"选项
+  if (/下拉/.test(s) && /选(择|中)/.test(s) && /["'](.+?)["']/.test(s)) {
+    const field = (s.match(/在(.+?)下拉/) || [])[1] || ''
+    const value = (s.match(/["'](.+?)["']/) || [])[1]
+    ruleSummary.steps.push({ text: s, rule: 'select-dropdown', hit: true })
+    return (
+      `{\n` +
+      `  ${field ? `const selectField = page.locator('.ant-form-item:has(label:has-text("${field}")) .ant-select');` : `const selectField = page.locator('.ant-select').first();`}\n` +
+      `  await selectField.click();\n` +
+      `  await page.locator('.ant-select-dropdown .ant-select-item-option[title="${value}"], .ant-select-dropdown .ant-select-item:has-text("${value}")').first().click();\n` +
+      `}`
+    )
+  }
+
+  // 表格勾选：在表格中勾选"YYY"/勾选"YYY"行
+  if (/(表格|列表).*(勾选|选中)|勾选.*行/.test(s) && /["'](.+?)["']/.test(s)) {
+    const rowKey = (s.match(/["'](.+?)["']/) || [])[1]
+    ruleSummary.steps.push({ text: s, rule: 'table-row-check', hit: true })
+    return (
+      `{\n` +
+      `  const row = page.locator('tr:has(:text("${rowKey}"))');\n` +
+      `  await row.locator('input[type="checkbox"]').first().check({ force: true });\n` +
+      `}`
+    )
+  }
+
+  // 标签切换：切换到"XXX"标签/Tab
+  if (/(切换|进入).*(标签|Tab)/.test(s) && /["'](.+?)["']/.test(s)) {
+    const tab = (s.match(/["'](.+?)["']/) || [])[1]
+    ruleSummary.steps.push({ text: s, rule: 'switch-tab', hit: true })
+    return `await page.getByRole('tab', { name: '${tab}' }).click();`
+  }
+
+  // 日期选择：在XXX日期选择器中选择"YYYY-MM-DD"/选择日期"YYYY-MM-DD"
+  if ((/日期|date/.test(s)) && /[0-9]{4}-[0-9]{2}-[0-9]{2}/.test(s)) {
+    const field = (s.match(/在(.+?)(日期|date)/) || [])[1] || ''
+    const dateVal = (s.match(/([0-9]{4}-[0-9]{2}-[0-9]{2})/) || [])[1]
+    ruleSummary.steps.push({ text: s, rule: 'pick-date', hit: true })
+    return (
+      `{\n` +
+      `  ${field ? `const dateInput = page.locator('.ant-form-item:has(label:has-text("${field}")) input').first();` : `const dateInput = page.locator('.ant-picker input').first();`}\n` +
+      `  await dateInput.click();\n` +
+      `  await dateInput.fill('${dateVal}');\n` +
+      `  await dateInput.press('Enter');\n` +
+      `}`
+    )
+  }
+  // 通用：在文本域中输入长文本
+  if (/(文本域|多行|textarea).*(输入|填写)/.test(s)) {
+    const value = (s.match(/输入["'](.+?)["']/) || [])[1] || '示例多行文本';
+    ruleSummary.steps.push({ text: s, rule: 'fill-textarea', hit: true });
+    return (
+      `{\n` +
+      `  const area = page.locator('.ant-modal-content textarea').first();\n` +
+      `  await area.fill('');\n` +
+      `  await area.type('${value}', { delay: 10 });\n` +
+      `}`
+    );
+  }
+  // 超长输入（1001个字符）
+  if (/1001个字符|1000个字符以上/.test(s)) {
+    ruleSummary.steps.push({ text: s, rule: 'fill-1001-chars', hit: true });
+    return (
+      `{\n` +
+      `  const longText = 'A'.repeat(1001);\n` +
+      `  const descArea = page.locator('.ant-modal-content textarea').first();\n` +
+      `  await descArea.fill(longText);\n` +
+      `}`
+    );
+  }
+
+  // 指定长度/字符集输入：在XXX中输入31个字符/特殊字符/中英文
+  if (/在.+?(中|里).*(输入|填写).*(\d+个字符|特殊字符|中英文)/.test(s)) {
+    const labelText = (s.match(/在(.+?)(输入|填写)/) || [])[1]?.replace(/(中|里)$/,'').trim() || '';
+    let value = 'A'.repeat(31);
+    if (/\d+个字符/.test(s)) {
+      const n = parseInt((s.match(/(\d+)个字符/) || [])[1] || '31', 10);
+      if (Number.isFinite(n) && n > 0) value = 'A'.repeat(n);
+    } else if (/特殊字符/.test(s)) {
+      value = '!@#$%^&*()_+-={}[]:;"\',.<>/?~';
+    } else if (/中英文/.test(s)) {
+      value = '中文ABCabc123';
+    }
+    ruleSummary.steps.push({ text: s, rule: 'fill-by-pattern', hit: true });
+    return (
+      `{\n` +
+      `  const targetInput = page.locator('.ant-modal-content .ant-form-item:has(label:has-text("${labelText}"))').locator('input:not([type="hidden"]), textarea').first();\n` +
+      `  await targetInput.fill('');\n` +
+      `  await targetInput.type(${JSON.stringify(value)}, { delay: 10 });\n` +
+      `}`
+    );
+  }
+
+  // 清空指定字段
+  if (/清空.+?(字段|输入框)/.test(s)) {
+    const labelText = (s.match(/清空(.+?)(字段|输入框)/) || [])[1] || '';
+    ruleSummary.steps.push({ text: s, rule: 'clear-field', hit: true });
+    return (
+      `{\n` +
+      `  const targetInput = page.locator('.ant-modal-content .ant-form-item:has(label:has-text("${labelText}"))').locator('input:not([type="hidden"]), textarea').first();\n` +
+      `  await targetInput.fill('');\n` +
+      `}`
+    );
+  }
+
+  ruleSummary.steps.push({ text: s, rule: 'unmatched', hit: false });
+  return null;
+}
+
+// 将中文预期映射为断言（启发式）
+function mapExpectToCode(exp, ruleSummary) {
+  if (!exp) return null;
+  const e = exp.trim();
+  if (/弹窗.*弹出|正常弹出/.test(e)) {
+    ruleSummary.expects.push({ text: e, rule: 'modal-visible', hit: true });
+    return (`await expect(page.locator('.ant-modal-content')).toBeVisible();`);
+  }
+  // “弹窗标题正确显示/为xxx”
+  if (/弹窗标题(正确)?显示/.test(e) && !(/["“”]/.test(e))) {
+    ruleSummary.expects.push({ text: e, rule: 'modal-title-visible', hit: true });
+    return (`await expect(page.locator('.ant-modal-title')).toBeVisible();`);
+  }
+  // 预期：弹窗标题包含"xxx"
+  const title2 = e.match(/(弹窗|对话框|Modal).*(标题|title).*?["'](.+?)["']/);
+  if (title2) {
+    ruleSummary.expects.push({ text: e, rule: 'modal-title-contains', hit: true });
+    return (`await expect(page.locator('.ant-modal-title')).toContainText('${title2[3]}');`);
+  }
+  const title = e.match(/弹窗标题.*["'](.+?)["']/);
+  if (title) {
+    ruleSummary.expects.push({ text: e, rule: 'modal-title-regexp', hit: true });
+    return (`await expect(page.locator('.ant-modal-title')).toHaveText(/${title[1]}/);`);
+  }
+  // 弹窗包含若干输入字段：以中文顿号、逗号分隔
+  const hasFields = e.match(/(包含|应有|应包含).*?(输入|字段|表单).*?[:：](.+)$/)
+  if (hasFields) {
+    const list = hasFields[3].split(/[、，,]/).map(x => x.trim()).filter(Boolean)
+    ruleSummary.expects.push({ text: e, rule: 'modal-has-fields', hit: true })
+    return list.map(lbl => `await expect(page.locator('.ant-modal-content .ant-form-item:has(label:has-text("${lbl}"))')).toBeVisible();`).join('\n');
+  }
+  // 所有输入都有占位/标识
+  if (/所有.*输入.*(占位|placeholder|标识)/.test(e)) {
+    ruleSummary.expects.push({ text: e, rule: 'all-input-has-placeholder', hit: true })
+    return (
+      `const items = page.locator('.ant-modal-content .ant-form-item');\n` +
+      `const count = await items.count();\n` +
+      `for (let i=0;i<count;i++){\n` +
+      `  const it = items.nth(i);\n` +
+      `  const input = it.locator('input:not([type="hidden"]), textarea').first();\n` +
+      `  if (await input.count()){\n` +
+      `    const ph = await input.getAttribute('placeholder');\n` +
+      `    expect(ph ?? '').not.toEqual('');\n` +
+      `  }\n` +
+      `}`
+    );
+  }
+  if (/必填字段/.test(e)) {
+    ruleSummary.expects.push({ text: e, rule: 'required-fields-visible', hit: true });
+    return (
+      `const inputs = page.locator('.ant-modal-content input:not([type="hidden"])');\n` +
+      `await expect(inputs.first()).toBeVisible();\n` +
+      `await expect(page.locator('.ant-modal-content textarea')).toBeVisible();\n` +
+      `await expect(page.locator('.ant-modal-content .ant-radio-group')).toBeVisible();`
+    );
+  }
+  if (/两个操作按钮.*(取消|确定)/.test(e)) {
+    ruleSummary.expects.push({ text: e, rule: 'two-actions-visible', hit: true });
+    return (
+      `await expect(page.getByRole('button', { name: '取消' })).toBeVisible();\n` +
+      `await expect(page.getByRole('button', { name: /^(确定|确认|保 存|保存)$/ })).toBeVisible();`
+    );
+  }
+  // 通用：验证"XXX"被选中
+  const checked = e.match(/(选中|被选中).*?["'](.+?)["']/);
+  if (checked) {
+    const label = checked[2];
+    ruleSummary.expects.push({ text: e, rule: 'option-checked', hit: true });
+    return (`await expect(page.locator('.ant-modal-content label:has-text("${label}") input[type="radio"], .ant-modal-content label:has-text("${label}") input[type="checkbox"]').first()).toBeChecked();`);
+  }
+  if (/选中.*明显.*反馈/.test(e)) {
+    ruleSummary.expects.push({ text: e, rule: 'selected-feedback-visible', hit: true });
+    return (`await expect(page.locator('.ant-modal-content .ant-radio-wrapper-checked')).toBeVisible();`);
+  }
+  if (/应提示.*超出.*长度|字数限制/.test(e)) {
+    ruleSummary.expects.push({ text: e, rule: 'length-exceeded-error', hit: true })
+    return (`await expect(page.locator('.ant-form-item-explain-error')).toContainText(/超出|长度|字数/);`);
+  }
+  if (/显示当前输入的字数/.test(e)) {
+    return `// TODO: 如果有字数统计元素，请在此添加选择器断言`;
+  }
+  if (/未填写.*点击.*确定.*提示/.test(e)) {
+    return `// TODO: 根据校验提示元素断言为空提示，例如 .ant-form-item-explain-error`;
+  }
+  if (/填写完整.*点击.*确定.*保存成功|关闭弹窗/.test(e)) {
+    return `// TODO: 依据系统的成功提示断言，例如 .ant-message-success 或弹窗关闭`;
+  }
+  if (/输入合法字符.*(正常|成功).*显示/.test(e)) {
+    ruleSummary.expects.push({ text: e, rule: 'valid-input-no-error', hit: true })
+    return (`await expect(page.locator('.ant-form-item-explain-error')).toHaveCount(0);`);
+  }
+  ruleSummary.expects.push({ text: e, rule: 'unmatched', hit: false });
+  return null;
+}
 
 // 安全解析测试文件路径，限制在 tests/generated 目录
 function resolveTestFilePath(relativeFile) {
@@ -239,6 +671,36 @@ app.post('/api/execute-test', async (req, res) => {
       console.error('❌ 生成 Playwright 报告失败:', reportError);
     }
     
+    // 保存简要报告到文件
+    try {
+      const reportsDir = path.join(__dirname, '../test-results/reports');
+      await fs.mkdir(reportsDir, { recursive: true });
+      const report = {
+        id: `single-${Date.now()}`,
+        name: (testFile || '').split('/').pop(),
+        testSuite: '单用例',
+        executionTime: new Date().toISOString(),
+        status: result.success ? 'success' : 'failure',
+        totalTests: 1,
+        passedTests: result.success ? 1 : 0,
+        failedTests: result.success ? 0 : 1,
+        successRate: result.success ? 100 : 0,
+        tests: [
+          {
+            id: '1',
+            name: (testFile || '').split('/').pop(),
+            status: result.success ? 'success' : 'failure',
+            duration,
+            error: result.error || undefined
+          }
+        ],
+        reportId
+      };
+      await fs.writeFile(path.join(reportsDir, `${report.id}.json`), JSON.stringify(report, null, 2));
+    } catch (e) {
+      console.warn('写入单用例报告失败:', e.message);
+    }
+
     res.json({
       success: true,
       testFile,
@@ -296,6 +758,28 @@ app.post('/api/execute-all-tests', async (req, res) => {
       console.error('❌ 生成 Playwright 报告失败:', reportError);
     }
     
+    // 保存汇总报告
+    try {
+      const reportsDir = path.join(__dirname, '../test-results/reports');
+      await fs.mkdir(reportsDir, { recursive: true });
+      const summary = {
+        id: `suite-${Date.now()}`,
+        name: '批量执行',
+        testSuite: '全部用例',
+        executionTime: new Date().toISOString(),
+        status: report.passed === report.total ? 'success' : 'failure',
+        totalTests: report.total,
+        passedTests: report.passed,
+        failedTests: report.failed,
+        successRate: report.total > 0 ? Math.round((report.passed / report.total) * 100) : 0,
+        tests: results.map((r, idx) => ({ id: String(idx + 1), name: r.testFile || `case-${idx+1}` , status: r.success ? 'success' : 'failure', duration: r.duration || 0, error: r.error || undefined })),
+        reportId
+      };
+      await fs.writeFile(path.join(reportsDir, `${summary.id}.json`), JSON.stringify(summary, null, 2));
+    } catch (e) {
+      console.warn('写入汇总报告失败:', e.message);
+    }
+
     res.json({
       success: true,
       results,
@@ -313,6 +797,285 @@ app.post('/api/execute-all-tests', async (req, res) => {
       message: '执行所有测试失败',
       error: error.message
     });
+  }
+});
+
+// 列出保存的报告
+app.get('/api/reports', async (req, res) => {
+  try {
+    const reportsDir = path.join(__dirname, '../test-results/reports');
+    await fs.mkdir(reportsDir, { recursive: true });
+    const files = await fs.readdir(reportsDir);
+    const items = [];
+    for (const f of files) {
+      if (!f.endsWith('.json')) continue;
+      try {
+        const raw = await fs.readFile(path.join(reportsDir, f), 'utf8');
+        const json = JSON.parse(raw);
+        items.push(json);
+      } catch {}
+    }
+    // 最近的在前
+    items.sort((a, b) => new Date(b.executionTime).getTime() - new Date(a.executionTime).getTime());
+    // 如果没有专门的报告文件，尝试从 Playwright JSON 报告转换一份
+    if (items.length === 0) {
+      const jsonReport = path.join(__dirname, '../test-results/results.json');
+      try {
+        const converted = await parsePlaywrightJsonReport(jsonReport);
+        if (converted) items.push(converted);
+      } catch {}
+    }
+    res.json({ success: true, reports: items });
+  } catch (e) {
+    res.status(500).json({ success: false, message: '读取报告失败', error: e.message });
+  }
+});
+
+// 获取单个报告
+app.get('/api/report/:id', async (req, res) => {
+  try {
+    const id = req.params.id;
+    const file = path.join(__dirname, '../test-results/reports', `${id}.json`);
+    const raw = await fs.readFile(file, 'utf8');
+    const json = JSON.parse(raw);
+    res.json({ success: true, report: json });
+  } catch (e) {
+    res.status(404).json({ success: false, message: '报告不存在' });
+  }
+});
+
+// 从手动输入/文件元数据生成基础测试代码
+app.post('/api/generate-test', async (req, res) => {
+  try {
+    const { inputMethod, manualInput, files } = req.body || {};
+    const pageName = manualInput?.pageName || '未命名页面';
+    const pageUrl = manualInput?.pageUrl || '/';
+    const pageDesc = manualInput?.pageDescription || '';
+    const bodyMd = manualInput?.testCaseBody || '';
+
+    // 将 Markdown 用例拆分为多个测试
+    const parsedCases = parseMarkdownTestCases(bodyMd);
+    const header = `import { test, expect } from '@playwright/test';\n\n`;
+    const suiteStart = `test.describe('${pageName} - 自动生成用例', () => {\n`;
+    const suiteEnd = `});\n`;
+    const tests = parsedCases.length > 0 ? parsedCases.map((c, i) => {
+      const stepCodes = (c.steps || []).map(s => mapStepToCode(s) || `// 步骤：${s}`).join('\n');
+      const expectCodes = (c.expects || []).map(e => mapExpectToCode(e) || `// 预期：${e}`).join('\n');
+      return `  test('${c.title || '用例' + (i+1)}', async ({ page }) => {\n    await page.goto('${pageUrl}');\n    await page.waitForLoadState('networkidle');\n${stepCodes ? stepCodes + '\n' : ''}${expectCodes ? expectCodes + '\n' : ''}  });\n`;
+    }).join('\n') : `  test('页面可访问', async ({ page }) => {\n    await page.goto('${pageUrl}');\n    await page.waitForLoadState('networkidle');\n    await expect(page).toHaveURL(/${pageUrl.replace(/\//g, '\\/')}/);\n  });\n`;
+    const code = header + suiteStart + tests + suiteEnd;
+    // 兜底：若未产生命中（例如用户未用“步骤/预期”分节），从原始 Markdown 行尝试规则匹配，确保前端“命中规则”有数据
+    if ((ruleSummary.steps.length === 0 && ruleSummary.expects.length === 0) && (bodyMd || '').trim()) {
+      const rawLines = bodyMd.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
+      for (const line of rawLines) {
+        const text = line.replace(/^[-•\d\.)]\s*/, '');
+        if (!text) continue;
+        if (/应|显示|选中|成功|失败|提示|可见|包含|等于|相等|标题/.test(text)) {
+          mapExpectToCode(text, ruleSummary);
+        } else {
+          mapStepToCode(text, ruleSummary);
+        }
+      }
+    }
+    // 若依然没有命中，则给出占位记录，便于前端展示
+    if (ruleSummary.steps.length === 0 && ruleSummary.expects.length === 0) {
+      ruleSummary.steps.push({ text: '未检测到可匹配的步骤语句', rule: 'none', hit: false });
+      ruleSummary.expects.push({ text: '未检测到可匹配的预期语句', rule: 'none', hit: false });
+    }
+
+    // 兜底：若未产生命中（例如用户未用“步骤/预期”分节），从原始 Markdown 行尝试规则匹配，以便前端展示命中规则
+    if ((ruleSummary.steps.length === 0 && ruleSummary.expects.length === 0) && (bodyMd || '').trim()) {
+      const rawLines = bodyMd.split(/\r?\n/).map(x => x.trim()).filter(Boolean)
+      for (const line of rawLines) {
+        const text = line.replace(/^[-•\d\.\)]\s*/, '')
+        if (!text) continue
+        if (/应|显示|选中|成功|失败|提示|可见|包含|等于|相等|标题/.test(text)) {
+          mapExpectToCode(text, ruleSummary)
+        } else {
+          mapStepToCode(text, ruleSummary)
+        }
+      }
+    }
+    // 若依然没有命中，则给出占位记录，便于前端展示
+    if (ruleSummary.steps.length === 0 && ruleSummary.expects.length === 0) {
+      ruleSummary.steps.push({ text: '未检测到可匹配的步骤语句', rule: 'none', hit: false })
+      ruleSummary.expects.push({ text: '未检测到可匹配的预期语句', rule: 'none', hit: false })
+    }
+
+    // 同步保存到 tests/generated 目录
+    const testsDir = path.join(__dirname, '../tests/generated');
+    await fs.mkdir(testsDir, { recursive: true });
+    const safeName = String(pageName)
+      .replace(/[^\u4e00-\u9fa5\w-]+/g, '-')
+      .replace(/-+/g, '-')
+      .replace(/^-|-$/g, '') || 'auto-test';
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+    const fileName = `${safeName}-ui-automation-${ts}.spec.ts`;
+    const filePath = path.join(testsDir, fileName);
+    await fs.writeFile(filePath, code, 'utf8');
+
+    res.json({ success: true, code, file: `tests/generated/${fileName}` });
+  } catch (error) {
+    console.error('生成测试代码失败:', error);
+    res.status(500).json({ success: false, message: '生成测试代码失败', error: error.message });
+  }
+});
+
+// 流式：生成测试（SSE 推送步骤/摘要/结果）
+app.post('/api/generate-test-stream', async (req, res) => {
+  try {
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    // 立即刷新响应头，避免代理缓冲
+    if (typeof res.flushHeaders === 'function') {
+      res.flushHeaders();
+    }
+
+    const send = (event, dataObj) => {
+      try {
+        const dataStr = JSON.stringify(dataObj);
+        console.log(`📤 发送 ${event} 事件，数据长度: ${dataStr.length} 字符`);
+        res.write(`event: ${event}\n`);
+        res.write(`data: ${dataStr}\n\n`);
+        console.log(`✅ ${event} 事件发送完成`);
+      } catch (e) {
+        console.error(`❌ 发送 ${event} 事件失败:`, e);
+        // 写入失败通常是客户端断开
+      }
+    };
+
+    // 初始心跳，确保前端可读到第一帧
+    send('ping', { t: Date.now() });
+
+    // 客户端断开时清理（使用 res 的 close，更可靠）
+    res.on('close', () => {
+      try {
+        console.log('[SSE] client connection closed');
+      } catch {}
+    });
+
+    const { inputMethod, manualInput, files } = req.body || {};
+    const pageName = manualInput?.pageName || '未命名页面';
+    const pageUrl = manualInput?.pageUrl || '/';
+    const bodyMd = manualInput?.testCaseBody || '';
+    
+    console.log('📝 接收到的用例内容:', bodyMd);
+    console.log('📝 用例内容长度:', bodyMd.length);
+    console.log('📝 用例内容前100字符:', bodyMd.substring(0, 100));
+
+    send('progress', { message: '校验输入与上传文件' });
+    await new Promise(r => setTimeout(r, 150));
+    send('progress', { message: '抽取页面关键信息与控件' });
+
+    const parsedCases = parseMarkdownTestCases(bodyMd);
+    console.log('🔍 解析到的用例:', JSON.stringify(parsedCases, null, 2));
+    send('progress', { message: `解析用例文本并结构化步骤（${parsedCases.length} 个用例）` });
+
+    const header = `import { test, expect } from '@playwright/test';\n\n`;
+    const suiteStart = `test.describe('${pageName} - 自动生成用例', () => {\n`;
+    const suiteEnd = `});\n`;
+    const ruleSummary = { steps: [], expects: [] };
+    const tests = parsedCases.length > 0 ? parsedCases.map((c, i) => {
+      const stepCodes = (c.steps || []).map(s => mapStepToCode(s, ruleSummary) || `// 步骤：${s}`).join('\n');
+      const expectCodes = (c.expects || []).map(e => mapExpectToCode(e, ruleSummary) || `// 预期：${e}`).join('\n');
+      return `  test('${c.title || '用例' + (i+1)}', async ({ page }) => {\n    await page.goto('${pageUrl}');\n    await page.waitForLoadState('networkidle');\n${stepCodes ? stepCodes + '\n' : ''}${expectCodes ? expectCodes + '\n' : ''}  });\n`;
+    }).join('\n') : `  test('页面可访问', async ({ page }) => {\n    await page.goto('${pageUrl}');\n    await page.waitForLoadState('networkidle');\n    await expect(page).toHaveURL\(/${pageUrl.replace(/\//g, '\\/')}\/\);\n  });\n`;
+    const code = header + suiteStart + tests + suiteEnd;
+    // 若有结构化用例，将用例标题作为进度步骤抛给前端，增强“步骤推演”数据
+    if (parsedCases.length > 0) {
+      parsedCases.forEach((c, i) => send('progress', { message: `${i + 1}. ${c.title || '用例' + (i+1)}` }));
+    }
+
+    // 兜底：如果未命中任何规则，则基于原始 Markdown 行做启发式匹配
+    if ((ruleSummary.steps.length === 0 && ruleSummary.expects.length === 0) && (bodyMd || '').trim()) {
+      console.log('🔍 开始兜底规则匹配，原始文本:', bodyMd);
+      const rawLines = bodyMd.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
+      console.log('📝 解析到的行数:', rawLines.length);
+      for (const line of rawLines) {
+        const text = line.replace(/^[-•\d\.)]\s*/, '');
+        if (!text) continue;
+        console.log('🔍 处理行:', text);
+        if (/应|显示|选中|成功|失败|提示|可见|包含|等于|相等|标题|预期|结果/.test(text)) {
+          console.log('✅ 识别为预期:', text);
+          mapExpectToCode(text, ruleSummary);
+        } else {
+          console.log('✅ 识别为步骤:', text);
+          mapStepToCode(text, ruleSummary);
+        }
+      }
+      console.log('📊 兜底后的规则摘要:', ruleSummary);
+    }
+    // 仍为空则填充占位项，确保前端能渲染
+    if (ruleSummary.steps.length === 0 && ruleSummary.expects.length === 0) {
+      ruleSummary.steps.push({ text: '未检测到可匹配的步骤语句', rule: 'none', hit: false });
+      ruleSummary.expects.push({ text: '未检测到可匹配的预期语句', rule: 'none', hit: false });
+    }
+
+    // 保存到 tests/generated 目录，保持与非流式接口一致的落盘行为
+    const testsDir = path.join(__dirname, '../tests/generated');
+    await fs.mkdir(testsDir, { recursive: true });
+    const safeName = String(pageName)
+      .replace(/[^\u4e00-\u9fa5\w-]+/g, '-')
+      .replace(/-+/g, '-')
+      .replace(/^-|-$/g, '') || 'auto-test';
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+    const fileName = `${safeName}-ui-automation-${ts}.spec.ts`;
+    const filePath = path.join(testsDir, fileName);
+    await fs.writeFile(filePath, code, 'utf8');
+
+    send('analysis', { summary: '已生成基础用例与断言，建议执行前确认关键定位与前置条件。' });
+    
+    // 调试：打印规则摘要
+    console.log('🚀 准备发送规则摘要:', JSON.stringify(ruleSummary, null, 2));
+    
+    // 先发送一个简化版的 rules 事件，确保前端能收到
+    console.log('📤 准备发送简化版 rules 事件...');
+    const simpleRules = { 
+      steps: ruleSummary.steps.slice(0, 3), // 只发送前3个步骤
+      expects: ruleSummary.expects.slice(0, 3) // 只发送前3个预期
+    };
+    send('rules', simpleRules);
+    console.log('✅ 简化版 rules 事件已发送');
+    
+    // 强制刷新输出缓冲区
+    console.log('🔄 强制刷新输出缓冲区...');
+    if (res.flush) res.flush();
+    
+    // 等待一下，确保 rules 事件被处理
+    console.log('⏳ 等待 1000ms...');
+    await new Promise(r => setTimeout(r, 1000));
+    console.log('✅ 等待完成');
+    
+    // 再次强制刷新
+    console.log('🔄 再次强制刷新输出缓冲区...');
+    if (res.flush) res.flush();
+    
+    // 然后发送完整的 result 事件
+    console.log('📤 准备发送 result 事件...');
+    send('result', { code, steps: parsedCases.flatMap(c => c.steps || []).slice(0, 12), file: `tests/generated/${fileName}`, rules: ruleSummary });
+    console.log('✅ result 事件已发送');
+    
+    // 最后强制刷新
+    console.log('🔄 最后强制刷新输出缓冲区...');
+    if (res.flush) res.flush();
+    
+    // 再等待一下，确保所有事件都被发送
+    console.log('⏳ 最后等待 500ms...');
+    await new Promise(r => setTimeout(r, 500));
+    console.log('✅ 最后等待完成');
+    
+    // 最后强制刷新
+    console.log('🔄 最终强制刷新输出缓冲区...');
+    if (res.flush) res.flush();
+
+    res.end();
+  } catch (e) {
+    try {
+      res.write(`event: error\n`);
+      res.write(`data: ${JSON.stringify({ message: e.message })}\n\n`);
+    } catch {}
+    res.end();
   }
 });
 

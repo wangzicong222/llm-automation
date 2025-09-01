@@ -288,6 +288,17 @@
     </div>
   </div>
   
+  <!-- 右侧：AI 思考摘要（固定悬浮） -->
+  <div class="insight-panel">
+    <div class="insight-header">
+      <span>🧠 AI 思考摘要</span>
+      <span v-if="isExecuting" class="insight-badge running">分析中</span>
+      <span v-else-if="currentAnalysis" class="insight-badge done">已生成</span>
+    </div>
+    <div class="insight-body">
+      <pre class="insight-pre">{{ currentAnalysis || '执行后这里会显示AI对执行输出与日志的摘要。' }}</pre>
+    </div>
+  </div>
   <!-- 编辑脚本模态框 -->
   <div v-if="showEditor" class="modal-overlay" @click="() => { showEditor = false; disposeMonaco() }">
     <div class="modal-content wide" @click.stop>
@@ -325,7 +336,8 @@
       </div>
     </div>
   </div>
-</template>
+ 
+ </template>
 
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue'
@@ -348,6 +360,7 @@ const executionResults = ref<any[]>([])
 const testReport = ref<any>(null)
 const showTestDetails = ref(false)
 const selectedTestDetail = ref<any>(null)
+const currentAnalysis = ref('')
 
 // 可用测试文件
 type FileItem = { path: string; updatedAt: number; runs?: number }
@@ -418,7 +431,14 @@ const executeTest = async () => {
     
     if (response.ok) {
       const result = await response.json()
-      executionResults.value = [result]
+      // 规范化：将 stdout/stderr 提升到顶层，便于前端展示
+      const normalized = {
+        ...result,
+        stdout: result?.result?.stdout,
+        stderr: result?.result?.stderr
+      }
+      executionResults.value = [normalized]
+      currentAnalysis.value = result.analysis || ''
       updateExecutionStats()
     } else {
       throw new Error('执行失败')
@@ -699,7 +719,10 @@ const loadAvailableTestFiles = async () => {
     const response = await fetch('http://localhost:3002/api/available-tests')
     if (response.ok) {
       const data = await response.json()
-      filesWithMeta.value = (data.files || []).map((x: any) => ({ path: x.path || x, updatedAt: x.updatedAt || Date.now(), runs: x.runs || 0 }))
+      filesWithMeta.value = (data.files || [])
+        .map((x: any) => ({ path: x.path || x, updatedAt: x.updatedAt || Date.now(), runs: x.runs || 0 }))
+        // 按更新时间倒序（最新在前）
+        .sort((a: any, b: any) => (b.updatedAt || 0) - (a.updatedAt || 0))
       // 合并到本地 runCounts
       for (const item of filesWithMeta.value) {
         runCounts.value[item.path] = item.runs || 0
@@ -1208,6 +1231,61 @@ const loadAvailableTestFiles = async () => {
 .error-message {
   color: #dc3545;
   border-left: 4px solid #dc3545;
+}
+
+/* 右侧 AI 思考摘要面板样式 */
+.insight-panel {
+  position: fixed;
+  right: 16px;
+  top: 88px;
+  width: 360px;
+  max-height: calc(100vh - 120px);
+  background: #ffffff;
+  border: 1px solid #eef2f7;
+  border-radius: 12px;
+  box-shadow: 0 8px 24px rgba(16,24,40,0.08);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  z-index: 20;
+}
+
+.insight-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 14px;
+  font-weight: 600;
+  color: #111827;
+  background: #f8fafc;
+  border-bottom: 1px solid #eef2f7;
+}
+
+.insight-badge {
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: 10px;
+}
+
+.insight-badge.running { background: #e0f2fe; color: #0369a1; }
+.insight-badge.done { background: #dcfce7; color: #166534; }
+
+.insight-body {
+  padding: 12px;
+  overflow: auto;
+}
+
+.insight-pre {
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  color: #374151;
+}
+
+@media (max-width: 1200px) {
+  .insight-panel { display: none; }
 }
 
 @media (max-width: 768px) {
