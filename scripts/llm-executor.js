@@ -30,7 +30,8 @@ class LLMTestExecutor {
         testFile,
         result,
         analysis,
-        success: result.exitCode === 0
+        success: result.exitCode === 0,
+        duration: result.duration || 0
       };
       
     } catch (error) {
@@ -48,16 +49,20 @@ class LLMTestExecutor {
       // 这里不再覆盖 --reporter，避免丢失 json 输出文件（test-results/results.json）
       const command = `npx playwright test "${testFile}" ${headed}`.trim();
       
+      const startTime = Date.now();
       console.log(`📋 执行命令: ${command}`);
       
       exec(command, { cwd: process.cwd(), env: { ...process.env } }, (error, stdout, stderr) => {
+        const duration = Date.now() - startTime;
+        
         if (error) {
           console.error('❌ 测试执行失败:', error.message);
           resolve({
             exitCode: error.code || 1,
             stdout: stdout,
             stderr: stderr,
-            error: error.message
+            error: error.message,
+            duration: duration
           });
         } else {
           console.log('✅ 测试执行完成');
@@ -89,7 +94,8 @@ class LLMTestExecutor {
           resolve({
             exitCode: 0,
             stdout: stdout,
-            stderr: stderr
+            stderr: stderr,
+            duration: duration
           });
         }
       });
@@ -98,6 +104,16 @@ class LLMTestExecutor {
 
   async analyzeTestResult(result) {
     try {
+      // 检查是否启用 LLM 分析
+      const enableLLMAnalysis = process.env.LLM_ANALYSIS_ENABLED !== 'false';
+      const hasValidAPIKey = process.env.DEEPSEEK_API_KEY && 
+                            process.env.DEEPSEEK_API_KEY !== 'your_deepseek_api_key_here';
+      
+      if (!enableLLMAnalysis || !hasValidAPIKey) {
+        console.log('⚠️ LLM 分析已禁用或 API Key 未配置，跳过分析');
+        return 'LLM 分析已禁用，请配置 DEEPSEEK_API_KEY 启用分析功能';
+      }
+      
       console.log('🔍 分析测试结果...');
       
       const prompt = `请分析以下Playwright测试执行结果，并提供改进建议：
@@ -162,7 +178,8 @@ ${result.error ? `- 错误信息: ${result.error}` : ''}
         results.push({
           testFile,
           success: false,
-          error: error.message
+          error: error.message,
+          duration: 0
         });
       }
     }

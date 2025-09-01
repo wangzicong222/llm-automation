@@ -243,6 +243,13 @@
                   </li>
                 </ul>
               </div>
+              
+              <!-- 提Bug按钮 -->
+              <div class="bug-report-section" v-if="ruleSummary.steps.length > 0 || ruleSummary.expects.length > 0">
+                <button @click="openBugDialog" class="bug-report-btn">
+                  🐛 基于此规则提 Bug
+                </button>
+              </div>
             </div>
           </template>
         </div>
@@ -251,6 +258,35 @@
           <button class="btn primary" @click="generateTestCode">重新生成</button>
         </div>
       </aside>
+    </div>
+    
+    <!-- 提Bug弹窗 -->
+    <div v-if="bugDialog.visible" class="bug-modal" @click="closeBugDialog">
+      <div class="modal-content" @click.stop>
+        <div class="modal-header">
+          <h3>提 Bug - 基于测试规则</h3>
+          <button @click="closeBugDialog" class="close-btn">×</button>
+        </div>
+        <div class="modal-body">
+          <div class="form-row">
+            <label>标题</label>
+            <input v-model="bugForm.title" />
+          </div>
+          <!-- 隐藏优先级和严重程度选择，使用默认值 -->
+          <div class="form-row">
+            <label>指派给</label>
+            <input v-model="bugForm.owner" placeholder="TAPD 用户名（可选）" />
+          </div>
+          <div class="form-row">
+            <label>Bug描述</label>
+            <textarea v-model="bugForm.description" rows="12"></textarea>
+          </div>
+          <div class="modal-footer">
+            <button class="btn ghost" @click="closeBugDialog">取消</button>
+            <button class="btn primary" @click="submitBug" :disabled="bugSubmitting">{{ bugSubmitting ? '提交中...' : '提交' }}</button>
+          </div>
+        </div>
+      </div>
     </div>
   </div>
 </template>
@@ -281,6 +317,17 @@ const manualInput = ref<ManualInput>({
 })
 const generatedCode = ref('')
 const isAnalyzing = ref(false)
+
+// Bug提交相关
+const bugDialog = ref<{ visible: boolean }>({ visible: false })
+const bugSubmitting = ref(false)
+const bugForm = ref<{ title: string; severity: number; priority: number; owner?: string; description: string }>({
+  title: '',
+  severity: 3, // 一般
+  priority: 3, // 中
+  owner: '',
+  description: ''
+})
 const aiTab = ref<'steps'|'rules'>('steps')
 const stepsList = ref<string[]>([])
 // 存储从进度事件中提取的“用例标题”（例如："1. 基础押金创建流程"）
@@ -696,6 +743,102 @@ watch(stepsList, (steps) => {
   console.log('步骤列表更新:', steps.length, '个步骤')
 })
 
+// Bug提交相关方法
+function openBugDialog() {
+  bugDialog.value.visible = true
+  
+  // 构建详细的Bug描述
+  const matchedSteps = ruleSummary.value.steps.filter(s => s.hit)
+  const unmatchedSteps = ruleSummary.value.steps.filter(s => !s.hit)
+  const matchedExpects = ruleSummary.value.expects.filter(e => e.hit)
+  const unmatchedExpects = ruleSummary.value.expects.filter(e => !e.hit)
+  
+  const description = [
+    '【测试场景】',
+    `- 页面: ${manualInput.value.pageName || manualInput.value.pageUrl || '未指定'}`,
+    `- 描述: ${manualInput.value.pageDescription || '无'}`,
+    '',
+    '【复现步骤】',
+    ...stepsList.value.map((step, i) => `${i + 1}. ${step}`),
+    '',
+    '【期望结果】',
+    ...matchedExpects.map(e => `✅ ${e.text} (${e.rule})`),
+    ...unmatchedExpects.map(e => `❌ ${e.text} (${e.rule})`),
+    '',
+    '【实际结果】',
+    ...unmatchedSteps.map(s => `❌ ${s.text} - 规则未命中: ${s.rule}`),
+    ...unmatchedExpects.map(e => `❌ ${e.text} - 预期未满足: ${e.rule}`),
+    '',
+    '【规则命中详情】',
+    `- 步骤规则命中: ${matchedSteps.length}/${ruleSummary.value.steps.length}`,
+    `- 预期规则命中: ${matchedExpects.length}/${ruleSummary.value.expects.length}`,
+    '',
+    '【生成的测试用例】',
+    caseTitles.value.length > 0 ? caseTitles.value.map((title, i) => `${i + 1}. ${title}`).join('\n') : '无',
+  ].join('\n')
+  
+  bugForm.value.title = `[UI自动化] ${manualInput.value.pageName || '页面测试'} - 规则命中问题`
+  bugForm.value.description = description
+}
+
+function closeBugDialog() {
+  bugDialog.value.visible = false
+}
+
+async function submitBug() {
+  try {
+    bugSubmitting.value = true
+    
+    const matchedSteps = ruleSummary.value.steps.filter(s => s.hit)
+    const unmatchedSteps = ruleSummary.value.steps.filter(s => !s.hit)
+    const matchedExpects = ruleSummary.value.expects.filter(e => e.hit)
+    const unmatchedExpects = ruleSummary.value.expects.filter(e => !e.hit)
+    
+    const resp = await fetch('http://localhost:3002/api/bugs/report', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        testName: bugForm.value.title,
+        pageUrl: manualInput.value.pageUrl,
+        env: 'test',
+        browser: 'chromium',
+        steps: stepsList.value.map(step => ({ text: step, hit: true })),
+        expects: matchedExpects,
+        unmatchedRules: [...unmatchedSteps, ...unmatchedExpects],
+        matchedRules: [...matchedSteps, ...matchedExpects],
+        logs: `规则命中情况：步骤 ${matchedSteps.length}/${ruleSummary.value.steps.length}，预期 ${matchedExpects.length}/${ruleSummary.value.expects.length}`,
+        attachments: Object.values(uploadedFiles.value || {}).map((f: UploadedFile) => ({
+          name: f.name,
+          type: f.type,
+          size: f.size
+        })),
+        tapd: { 
+          severity: bugForm.value.severity, 
+          priority: bugForm.value.priority, 
+          owner: bugForm.value.owner 
+        },
+        executionTime: new Date().toISOString(),
+      })
+    })
+    
+    const data = await resp.json()
+    if (data?.success && data?.bug) {
+      let message = `已创建 Bug：${data.bug.id}`
+      if (data.bug.mocked) {
+        message += '\n(当前为模拟模式，如需对接真实TAPD，请配置环境变量)'
+      }
+      alert(message)
+      closeBugDialog()
+    } else {
+      alert(`创建失败：${data?.message || '未知错误'}`)
+    }
+  } catch (e: any) {
+    alert(`创建失败：${e.message}`)
+  } finally {
+    bugSubmitting.value = false
+  }
+}
+
 function copyCode() {
   navigator.clipboard.writeText(generatedCode.value)
   alert('代码已复制到剪贴板')
@@ -977,5 +1120,147 @@ function copyCode() {
 }
 .fallback-rules { 
   margin-top: 8px; 
+}
+
+/* Bug提交样式 */
+.bug-report-section {
+  margin-top: 16px;
+  text-align: center;
+  padding-top: 16px;
+  border-top: 1px solid #e2e8f0;
+}
+
+.bug-report-btn {
+  background: linear-gradient(135deg, #ef4444, #dc2626);
+  color: white;
+  border: none;
+  padding: 12px 24px;
+  border-radius: 8px;
+  font-size: 0.9rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s;
+  box-shadow: 0 2px 4px rgba(239, 68, 68, 0.2);
+}
+
+.bug-report-btn:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 8px rgba(239, 68, 68, 0.3);
+}
+
+.bug-modal {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  z-index: 2000;
+}
+
+.bug-modal .modal-content {
+  background: white;
+  border-radius: 12px;
+  max-width: 800px;
+  width: 90%;
+  max-height: 90vh;
+  overflow-y: auto;
+}
+
+.bug-modal .modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 24px;
+  border-bottom: 1px solid #e2e8f0;
+}
+
+.bug-modal .modal-header h3 {
+  margin: 0;
+  color: #333;
+}
+
+.bug-modal .close-btn {
+  background: none;
+  border: none;
+  font-size: 1.5rem;
+  cursor: pointer;
+  color: #666;
+  padding: 0;
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+}
+
+.bug-modal .close-btn:hover {
+  background: #f1f5f9;
+}
+
+.bug-modal .modal-body {
+  padding: 24px;
+}
+
+.bug-modal .modal-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 12px;
+  margin-top: 24px;
+}
+
+/* 表单样式 */
+.form-row {
+  margin-bottom: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.form-row.two {
+  flex-direction: row;
+  gap: 16px;
+}
+
+.form-row.two > div {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.form-row label {
+  font-weight: 500;
+  color: #374151;
+  font-size: 0.875rem;
+}
+
+.form-row input,
+.form-row select,
+.form-row textarea {
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  padding: 12px;
+  font-size: 0.875rem;
+  transition: border-color 0.2s;
+}
+
+.form-row input:focus,
+.form-row select:focus,
+.form-row textarea:focus {
+  outline: none;
+  border-color: #3b82f6;
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+}
+
+.form-row textarea {
+  resize: vertical;
+  font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+  font-size: 0.8rem;
+  line-height: 1.4;
 }
 </style>
