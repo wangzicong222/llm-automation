@@ -184,6 +184,38 @@
                   <div v-if="test.error" class="test-error">
                     {{ test.error }}
                   </div>
+                  <div class="bug-actions" v-if="test.status==='failure'">
+                    <button class="btn-view" @click="openBugDialog(test)">提 Bug</button>
+                    <a v-if="test.tapdUrl" :href="test.tapdUrl" target="_blank" class="bug-link">查看 TAPD</a>
+                  </div>
+                </div>
+              </div>
+            </div>
+            
+            <!-- 提 Bug 弹窗 -->
+            <div v-if="bugDialog.visible" class="report-modal" @click="closeBugDialog">
+              <div class="modal-content" @click.stop>
+                <div class="modal-header">
+                  <h3>提 Bug - {{ bugDialog.test?.name }}</h3>
+                  <button @click="closeBugDialog" class="close-btn">×</button>
+                </div>
+                <div class="modal-body">
+                  <div class="form-row">
+                    <label>标题</label>
+                    <input v-model="bugForm.title" />
+                  </div>
+                  <!-- 隐藏优先级和严重程度选择，使用默认值 -->
+                  <div class="form-row">
+                    <label>指派给</label>
+                    <input v-model="bugForm.owner" placeholder="TAPD 用户名（可选）" />
+                  </div>
+                  <div class="form-row">
+                    <label>复现步骤/期望/实际</label>
+                    <textarea v-model="bugForm.description" rows="8"></textarea>
+                  </div>
+                  <div class="modal-footer">
+                    <button class="btn-view" @click="submitBug" :disabled="bugSubmitting">{{ bugSubmitting ? '提交中...' : '提交' }}</button>
+                  </div>
                 </div>
               </div>
             </div>
@@ -203,6 +235,7 @@ interface TestResult {
   status: 'success' | 'failure' | 'running'
   duration: number
   error?: string
+  tapdUrl?: string
 }
 
 interface TestReport {
@@ -223,6 +256,15 @@ const statusFilter = ref('')
 const dateFilter = ref('')
 const currentPage = ref(1)
 const selectedReport = ref<TestReport | null>(null)
+const bugDialog = ref<{ visible: boolean; test: TestResult | null }>({ visible: false, test: null })
+const bugSubmitting = ref(false)
+const bugForm = ref<{ title: string; severity: number; priority: number; owner?: string; description: string }>({
+  title: '',
+  severity: 3, // 一般
+  priority: 3, // 中
+  owner: '',
+  description: ''
+})
 
 const reports = ref<TestReport[]>([])
 
@@ -301,6 +343,91 @@ function viewReport(report: TestReport) {
 
 function closeModal() {
   selectedReport.value = null
+}
+
+function openBugDialog(test: TestResult) {
+  bugDialog.value = { visible: true, test }
+  bugForm.value.title = `[UI自动化] ${test.name}`
+  
+  // 构建更详细的描述
+  const report = selectedReport.value
+  const description = [
+    '【测试场景】',
+    `- 测试用例: ${test.name}`,
+    `- 报告: ${report?.name || '未知报告'}`,
+    `- 执行时间: ${report?.executionTime ? formatDate(report.executionTime) : '未知'}`,
+    `- 执行耗时: ${test.duration}ms`,
+    '',
+    '【复现步骤】',
+    '(请从"创建测试"页面的步骤推演中复制相关步骤)',
+    '',
+    '【期望结果】',
+    '(请从"创建测试"页面的命中规则中复制期望结果)',
+    '',
+    '【实际结果】',
+    test.error || '测试执行失败',
+    '',
+    '【附件信息】',
+    '系统将自动查找并附加相关的截图、视频和trace文件'
+  ].join('\n')
+  
+  bugForm.value.description = description
+}
+
+function closeBugDialog() {
+  bugDialog.value.visible = false
+}
+
+async function submitBug() {
+  if (!bugDialog.value.test) return
+  try {
+    bugSubmitting.value = true
+    const test = bugDialog.value.test
+    const report = selectedReport.value
+    
+    const resp = await fetch('http://localhost:3002/api/bugs/report', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        testName: test.name,
+        pageUrl: report?.testSuite || '',
+        env: 'test',
+        browser: 'chromium',
+        steps: [],
+        expects: [],
+        unmatchedRules: [test.error || '测试执行失败'],
+        matchedRules: [],
+        logs: test.error || '',
+        attachments: [],
+        tapd: { 
+          severity: bugForm.value.severity, 
+          priority: bugForm.value.priority, 
+          owner: bugForm.value.owner 
+        },
+        executionTime: report?.executionTime,
+        duration: test.duration,
+        reportId: report?.id
+      })
+    })
+    const data = await resp.json()
+    if (data?.success && data?.bug) {
+      // 更新测试结果，添加TAPD链接
+      test.tapdUrl = data.bug.url
+      
+      let message = `已创建 Bug：${data.bug.id}`
+      if (data.bug.mocked) {
+        message += '\n(当前为模拟模式，如需对接真实TAPD，请配置环境变量)'
+      }
+      alert(message)
+      closeBugDialog()
+    } else {
+      alert(`创建失败：${data?.message || '未知错误'}`)
+    }
+  } catch (e: any) {
+    alert(`创建失败：${e.message}`)
+  } finally {
+    bugSubmitting.value = false
+  }
 }
 
 function exportReport(report: TestReport) {
@@ -802,4 +929,24 @@ onMounted(async () => {
   font-size: 0.875rem;
   margin-top: 8px;
 }
+
+.bug-actions {
+  margin-top: 8px;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.bug-link {
+  color: #2563eb;
+  text-decoration: underline;
+  font-size: 0.875rem;
+}
+
+/* 简易表单样式 */
+.form-row { margin-bottom: 12px; display: flex; flex-direction: column; gap: 6px; }
+.form-row.two { flex-direction: row; gap: 12px; }
+.form-row.two > div { flex: 1; display: flex; flex-direction: column; gap: 6px; }
+.form-row input, .form-row select, .form-row textarea { border: 1px solid #e2e8f0; border-radius: 6px; padding: 10px; }
+.modal-footer { display: flex; justify-content: flex-end; margin-top: 12px; }
 </style>

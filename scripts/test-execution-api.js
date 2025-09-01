@@ -6,6 +6,65 @@ const { exec, spawn } = require('child_process');
 const LLMTestExecutor = require('./llm-executor.js');
 
 const app = express();
+const { TapdProvider } = require('./bug-provider');
+
+// 查找测试相关附件（截图、视频、trace等）
+async function findTestAttachments(testName, reportId) {
+  const attachments = [];
+  const resultsDir = path.join(__dirname, '../test-results');
+  
+  try {
+    // 查找可能的附件目录
+    const dirs = await fs.readdir(resultsDir, { withFileTypes: true });
+    
+    for (const dir of dirs) {
+      if (!dir.isDirectory()) continue;
+      
+      const dirPath = path.join(resultsDir, dir.name);
+      
+      // 检查目录名是否包含测试名称
+      if (testName && dir.name.toLowerCase().includes(testName.toLowerCase().replace(/\s+/g, '-'))) {
+        const files = await fs.readdir(dirPath);
+        
+        for (const file of files) {
+          const filePath = path.join(dirPath, file);
+          const stat = await fs.stat(filePath);
+          
+          if (stat.isFile()) {
+            const ext = path.extname(file).toLowerCase();
+            let type = 'file';
+            
+            if (['.png', '.jpg', '.jpeg'].includes(ext)) {
+              type = 'screenshot';
+            } else if (['.webm', '.mp4'].includes(ext)) {
+              type = 'video';
+            } else if (ext === '.zip' || file.includes('trace')) {
+              type = 'trace';
+            } else if (ext === '.md') {
+              type = 'report';
+            }
+            
+            attachments.push({
+              name: file,
+              path: filePath,
+              type: type,
+              size: stat.size
+            });
+          }
+        }
+      }
+    }
+    
+    // 限制附件数量和大小
+    return attachments
+      .filter(att => att.size < 10 * 1024 * 1024) // 小于10MB
+      .slice(0, 5); // 最多5个附件
+      
+  } catch (e) {
+    console.warn('查找测试附件失败:', e.message);
+    return [];
+  }
+}
 const PORT = 3002;
 
 // 中间件
@@ -841,6 +900,108 @@ app.get('/api/report/:id', async (req, res) => {
     res.json({ success: true, report: json });
   } catch (e) {
     res.status(404).json({ success: false, message: '报告不存在' });
+  }
+});
+
+// 提 Bug（单条）
+app.post('/api/bugs/report', async (req, res) => {
+  try {
+    const payload = req.body || {};
+    const {
+      testName,
+      pageUrl,
+      env = 'test',
+      browser = 'chromium',
+      steps = [],
+      expects = [],
+      unmatchedRules = [],
+      matchedRules = [],
+      logs = '',
+      attachments = [],
+      tapd = {},
+      executionTime,
+      duration,
+      reportId
+    } = payload;
+
+    const provider = new TapdProvider(process.env);
+    
+    // 尝试查找相关的测试附件（截图、视频、trace等）
+    const foundAttachments = await findTestAttachments(testName, reportId);
+    const allAttachments = [...attachments, ...foundAttachments];
+    
+    // 构建更详细的描述
+    const description = [
+      `【测试场景】`,
+      `- 测试用例: ${testName || '未命名用例'}`,
+      `- 页面地址: ${pageUrl || '-'}`,
+      `- 测试环境: ${env}`,
+      `- 浏览器: ${browser}`,
+      `- 执行时间: ${executionTime ? new Date(executionTime).toLocaleString('zh-CN') : '-'}`,
+      `- 执行耗时: ${duration ? `${duration}ms` : '-'}`,
+      reportId ? `- 报告ID: ${reportId}` : '',
+      '',
+      `【复现步骤】`,
+      ...(steps.length > 0 ? steps.map((s, i) => {
+        const text = typeof s === 'string' ? s : s.text;
+        const hit = typeof s === 'object' && s.hit !== undefined ? (s.hit ? ' ✅' : ' ❌') : '';
+        return `${i + 1}. ${text}${hit}`;
+      }) : ['暂无详细步骤记录']),
+      '',
+      `【期望结果】`,
+      ...(expects.length > 0 ? expects.map(e => {
+        const text = typeof e === 'string' ? e : e.text;
+        const hit = typeof e === 'object' && e.hit !== undefined ? (e.hit ? ' ✅' : ' ❌') : '';
+        return `- ${text}${hit}`;
+      }) : ['暂无期望结果记录']),
+      '',
+      `【实际结果】`,
+      ...(unmatchedRules.length > 0 ? unmatchedRules.map(u => {
+        const text = typeof u === 'string' ? u : (u.text || u.rule || String(u));
+        return `❌ ${text}`;
+      }) : ['测试执行失败，具体失败点请查看错误日志']),
+      '',
+      matchedRules.length > 0 ? `【成功验证项】` : '',
+      ...matchedRules.map(m => {
+        const text = typeof m === 'string' ? m : (m.text || m.rule || String(m));
+        return `✅ ${text}`;
+      }),
+      matchedRules.length > 0 ? '' : '',
+      logs ? `【错误日志】` : '',
+      logs ? '```' : '',
+      logs || '',
+      logs ? '```' : '',
+      '',
+      `【附件信息】`,
+      ...(allAttachments.length > 0 ? allAttachments.map(att => {
+        const size = att.size ? `${Math.round(att.size/1024)}KB` : 'unknown size';
+        const type = att.type || 'file';
+        const name = att.name || att.path || 'unnamed';
+        const path = att.path ? ` (${att.path})` : '';
+        return `- ${type}: ${name} (${size})${path}`;
+      }) : ['暂无附件']),
+      allAttachments.length > 0 ? `注意：由于TAPD API限制，附件暂未直接上传，请手动添加相关截图和视频` : '',
+      '',
+      `---`,
+      `此Bug由UI自动化测试系统自动创建`,
+      `创建人: ${provider.displayName}`,
+      `生成时间: ${new Date().toLocaleString('zh-CN')}`
+    ].filter(line => line !== null && line !== undefined).join('\n');
+
+    const bug = await provider.createBug({
+      title: `[UI自动化] ${testName || '未命名用例'}`,
+      description,
+      severity: tapd.severity,
+      priority: tapd.priority,
+      module_id: tapd.module_id,
+      owner: tapd.owner,
+      attachments: allAttachments,
+    });
+
+    res.json({ success: true, bug });
+  } catch (e) {
+    console.error('创建Bug失败:', e);
+    res.status(500).json({ success: false, message: e.message });
   }
 });
 
