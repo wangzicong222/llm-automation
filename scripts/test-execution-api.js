@@ -8,6 +8,9 @@ const LLMTestExecutor = require('./llm-executor.js');
 const app = express();
 const { TapdProvider } = require('./bug-provider');
 
+// 服务器配置
+const PORT = process.env.PORT || 3002;
+
 // 查找测试相关附件（截图、视频、trace等）
 async function findTestAttachments(testName, reportId) {
   const attachments = [];
@@ -65,7 +68,6 @@ async function findTestAttachments(testName, reportId) {
     return [];
   }
 }
-const PORT = 3002;
 
 // 中间件
 app.use(cors());
@@ -266,7 +268,7 @@ function parseMarkdownTestCases(markdown) {
 function mapStepToCode(step, ruleSummary) {
   if (!step) return null;
   const s = step.trim();
-  // 以“验证/校验”开头的步骤，转由预期规则处理
+  // 以"验证/校验"开头的步骤，转由预期规则处理
   if (/^(验证|校验)/.test(s)) {
     const mapped = mapExpectToCode(s.replace(/^(验证|校验)/, ''), ruleSummary);
     if (mapped) {
@@ -287,7 +289,7 @@ function mapStepToCode(step, ruleSummary) {
     return `// 已在测试内置跳转至页面`;
   }
   // 点击按钮
-  const clickBtn = s.match(/点击[“"']?(.+?)[”"']?按钮/);
+  const clickBtn = s.match(/点击[""']?(.+?)[""']?按钮/);
   if (clickBtn) {
     const name = clickBtn[1];
     ruleSummary.steps.push({ text: s, rule: 'click-button-by-name', hit: true });
@@ -446,8 +448,8 @@ function mapExpectToCode(exp, ruleSummary) {
     ruleSummary.expects.push({ text: e, rule: 'modal-visible', hit: true });
     return (`await expect(page.locator('.ant-modal-content')).toBeVisible();`);
   }
-  // “弹窗标题正确显示/为xxx”
-  if (/弹窗标题(正确)?显示/.test(e) && !(/["“”]/.test(e))) {
+  // "弹窗标题正确显示/为xxx"
+  if (/弹窗标题(正确)?显示/.test(e) && !(/["""]/.test(e))) {
     ruleSummary.expects.push({ text: e, rule: 'modal-title-visible', hit: true });
     return (`await expect(page.locator('.ant-modal-title')).toBeVisible();`);
   }
@@ -531,6 +533,31 @@ function mapExpectToCode(exp, ruleSummary) {
   }
   ruleSummary.expects.push({ text: e, rule: 'unmatched', hit: false });
   return null;
+}
+
+// 将 HTML/带序号的文本拆分为多行纯文本
+function splitTextLines(input) {
+  if (!input) return [];
+  let t = String(input);
+  // ol/li 换行
+  t = t
+    .replace(/<ol[^>]*>/gi, '')
+    .replace(/<\/ol>/gi, '')
+    .replace(/<li[^>]*>/gi, '')
+    .replace(/<\/li>/gi, '\n')
+    .replace(/<br\s*\/?>(\s*)/gi, '\n')
+    .replace(/<[^>]+>/g, '') // 去其余标签
+    .replace(/\r/g, '')
+    .trim();
+  // 根据序号或分隔符进一步拆分
+  const parts = t
+    .split(/\n+|(?:(?<=。|；))\s+/)
+    .flatMap(line => {
+      const m = line.match(/^(?:\d+[\.|、)]\s*)(.+)$/);
+      return m ? [m[1].trim()] : [line.trim()];
+    })
+    .filter(Boolean);
+  return parts;
 }
 
 // 安全解析测试文件路径，限制在 tests/generated 目录
@@ -903,6 +930,91 @@ app.get('/api/report/:id', async (req, res) => {
   }
 });
 
+// TAPD 测试用例相关接口
+app.get('/api/tapd/testcases', async (req, res) => {
+  try {
+    const { TapdProvider } = require('./bug-provider');
+    const provider = new TapdProvider();
+    
+    const { module, status, owner, limit = 50 } = req.query;
+    const options = {};
+    
+    if (module) options.module = module;
+    if (status) options.status = status;
+    if (owner) options.owner = owner;
+    if (limit) options.limit = parseInt(limit);
+    
+    const testCases = await provider.getTestCases(options);
+    
+    res.json({
+      success: true,
+      data: testCases,
+      total: testCases.length,
+      mocked: testCases.some(tc => tc.mocked)
+    });
+    
+  } catch (error) {
+    console.error('获取 TAPD 测试用例失败:', error.message);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+app.get('/api/tapd/testcases/:id', async (req, res) => {
+  try {
+    const { TapdProvider } = require('./bug-provider');
+    const provider = new TapdProvider();
+    
+    const { id } = req.params;
+    const testCase = await provider.getTestCaseDetail(id);
+    
+    if (!testCase) {
+      return res.status(404).json({
+        success: false,
+        error: '测试用例不存在'
+      });
+    }
+    
+    res.json({
+      success: true,
+      data: testCase,
+      mocked: testCase.mocked
+    });
+    
+  } catch (error) {
+    console.error('获取 TAPD 测试用例详情失败:', error.message);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// 获取 TAPD 筛选选项
+app.get('/api/tapd/filter-options', async (req, res) => {
+  try {
+    const { TapdProvider } = require('./bug-provider');
+    const provider = new TapdProvider();
+    
+    const filterOptions = await provider.getFilterOptions();
+    
+    res.json({
+      success: true,
+      data: filterOptions,
+      mocked: filterOptions.mocked
+    });
+    
+  } catch (error) {
+    console.error('获取 TAPD 筛选选项失败:', error.message);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
 // 提 Bug（单条）
 app.post('/api/bugs/report', async (req, res) => {
   try {
@@ -1019,13 +1131,20 @@ app.post('/api/generate-test', async (req, res) => {
     const header = `import { test, expect } from '@playwright/test';\n\n`;
     const suiteStart = `test.describe('${pageName} - 自动生成用例', () => {\n`;
     const suiteEnd = `});\n`;
+    const ruleSummary = { steps: [], expects: [] };
     const tests = parsedCases.length > 0 ? parsedCases.map((c, i) => {
-      const stepCodes = (c.steps || []).map(s => mapStepToCode(s) || `// 步骤：${s}`).join('\n');
-      const expectCodes = (c.expects || []).map(e => mapExpectToCode(e) || `// 预期：${e}`).join('\n');
+      const stepCodes = (c.steps || [])
+        .flatMap(s => splitTextLines(s))
+        .map(s => mapStepToCode(s, ruleSummary) || `// 步骤：${s}`)
+        .join('\n');
+      const expectCodes = (c.expects || [])
+        .flatMap(e => splitTextLines(e))
+        .map(e => mapExpectToCode(e, ruleSummary) || `// 预期：${e}`)
+        .join('\n');
       return `  test('${c.title || '用例' + (i+1)}', async ({ page }) => {\n    await page.goto('${pageUrl}');\n    await page.waitForLoadState('networkidle');\n${stepCodes ? stepCodes + '\n' : ''}${expectCodes ? expectCodes + '\n' : ''}  });\n`;
-    }).join('\n') : `  test('页面可访问', async ({ page }) => {\n    await page.goto('${pageUrl}');\n    await page.waitForLoadState('networkidle');\n    await expect(page).toHaveURL(/${pageUrl.replace(/\//g, '\\/')}/);\n  });\n`;
+    }).join('\n') : `  test('页面可访问', async ({ page }) => {\n    await page.goto('${pageUrl}');\n    await page.waitForLoadState('networkidle');\n    await expect(page).toHaveURL\(/${pageUrl.replace(/\//g, '\\/')}\/\);\n  });\n`;
     const code = header + suiteStart + tests + suiteEnd;
-    // 兜底：若未产生命中（例如用户未用“步骤/预期”分节），从原始 Markdown 行尝试规则匹配，确保前端“命中规则”有数据
+    // 兜底：若未产生命中（例如用户未用"步骤/预期"分节），从原始 Markdown 行尝试规则匹配，确保前端"命中规则"有数据
     if ((ruleSummary.steps.length === 0 && ruleSummary.expects.length === 0) && (bodyMd || '').trim()) {
       const rawLines = bodyMd.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
       for (const line of rawLines) {
@@ -1044,7 +1163,7 @@ app.post('/api/generate-test', async (req, res) => {
       ruleSummary.expects.push({ text: '未检测到可匹配的预期语句', rule: 'none', hit: false });
     }
 
-    // 兜底：若未产生命中（例如用户未用“步骤/预期”分节），从原始 Markdown 行尝试规则匹配，以便前端展示命中规则
+    // 兜底：若未产生命中（例如用户未用"步骤/预期"分节），从原始 Markdown 行尝试规则匹配，以便前端展示命中规则
     if ((ruleSummary.steps.length === 0 && ruleSummary.expects.length === 0) && (bodyMd || '').trim()) {
       const rawLines = bodyMd.split(/\r?\n/).map(x => x.trim()).filter(Boolean)
       for (const line of rawLines) {
@@ -1116,9 +1235,9 @@ app.post('/api/generate-test-stream', async (req, res) => {
       } catch {}
     });
 
-    const { inputMethod, manualInput, files } = req.body || {};
-    const pageName = manualInput?.pageName || '未命名页面';
-    const pageUrl = manualInput?.pageUrl || '/';
+    const { inputMethod, manualInput, files, tapdPageInfo, tapdSelected, tapdSelectedMeta } = req.body || {};
+    const pageName = (tapdPageInfo?.pageName || manualInput?.pageName) || '未命名页面';
+    const pageUrl = (tapdPageInfo?.pageUrl || manualInput?.pageUrl) || '/';
     const bodyMd = manualInput?.testCaseBody || '';
     
     console.log('📝 接收到的用例内容:', bodyMd);
@@ -1129,7 +1248,15 @@ app.post('/api/generate-test-stream', async (req, res) => {
     await new Promise(r => setTimeout(r, 150));
     send('progress', { message: '抽取页面关键信息与控件' });
 
-    const parsedCases = parseMarkdownTestCases(bodyMd);
+    // 若来自 TAPD，多选用例构造结构化用例；否则走 Markdown 解析
+    const parsedCases = Array.isArray(tapdSelected) && tapdSelected.length > 0
+      ? tapdSelected.map(tc => ({
+          title: tc.title,
+          steps: (tc.steps || []).map(s => s.action).filter(Boolean),
+          expects: tc.expectedResult ? [tc.expectedResult] : []
+        }))
+      : parseMarkdownTestCases(bodyMd);
+    console.log('🔍 TAPD 选择摘要:', tapdSelectedMeta);
     console.log('🔍 解析到的用例:', JSON.stringify(parsedCases, null, 2));
     send('progress', { message: `解析用例文本并结构化步骤（${parsedCases.length} 个用例）` });
 
@@ -1138,12 +1265,18 @@ app.post('/api/generate-test-stream', async (req, res) => {
     const suiteEnd = `});\n`;
     const ruleSummary = { steps: [], expects: [] };
     const tests = parsedCases.length > 0 ? parsedCases.map((c, i) => {
-      const stepCodes = (c.steps || []).map(s => mapStepToCode(s, ruleSummary) || `// 步骤：${s}`).join('\n');
-      const expectCodes = (c.expects || []).map(e => mapExpectToCode(e, ruleSummary) || `// 预期：${e}`).join('\n');
+      const stepCodes = (c.steps || [])
+        .flatMap(s => splitTextLines(s))
+        .map(s => mapStepToCode(s, ruleSummary) || `// 步骤：${s}`)
+        .join('\n');
+      const expectCodes = (c.expects || [])
+        .flatMap(e => splitTextLines(e))
+        .map(e => mapExpectToCode(e, ruleSummary) || `// 预期：${e}`)
+        .join('\n');
       return `  test('${c.title || '用例' + (i+1)}', async ({ page }) => {\n    await page.goto('${pageUrl}');\n    await page.waitForLoadState('networkidle');\n${stepCodes ? stepCodes + '\n' : ''}${expectCodes ? expectCodes + '\n' : ''}  });\n`;
     }).join('\n') : `  test('页面可访问', async ({ page }) => {\n    await page.goto('${pageUrl}');\n    await page.waitForLoadState('networkidle');\n    await expect(page).toHaveURL\(/${pageUrl.replace(/\//g, '\\/')}\/\);\n  });\n`;
     const code = header + suiteStart + tests + suiteEnd;
-    // 若有结构化用例，将用例标题作为进度步骤抛给前端，增强“步骤推演”数据
+    // 若有结构化用例，将用例标题作为进度步骤抛给前端，增强"步骤推演"数据
     if (parsedCases.length > 0) {
       parsedCases.forEach((c, i) => send('progress', { message: `${i + 1}. ${c.title || '用例' + (i+1)}` }));
     }

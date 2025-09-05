@@ -13,12 +13,16 @@
         <!-- 输入方式选择 -->
         <div class="input-method-selector">
           <label class="radio-group">
-            <input type="radio" v-model="inputMethod" value="file" />
-            <span>文件上传</span>
+            <input type="radio" v-model="inputMethod" value="tapd" />
+            <span>从 TAPD 导入</span>
           </label>
           <label class="radio-group">
             <input type="radio" v-model="inputMethod" value="manual" />
             <span>手动输入</span>
+          </label>
+          <label class="radio-group">
+            <input type="radio" v-model="inputMethod" value="file" />
+            <span>文件上传</span>
           </label>
         </div>
 
@@ -123,6 +127,186 @@
               <span>✅ {{ uploadedFiles.screenshot.name }}</span>
               <button @click="removeFile('screenshot')" class="remove-btn">删除</button>
             </div>
+          </div>
+        </div>
+
+        <!-- TAPD 导入方式 -->
+        <div v-if="inputMethod === 'tapd'" class="tapd-import-section">
+          <div class="form-group">
+            <div class="filter-row">
+              <button @click="loadTapdTestCases" class="load-btn" :disabled="loadingTapd">
+                {{ loadingTapd ? '加载中...' : '加载测试用例' }}
+              </button>
+            </div>
+            <div v-if="filterOptions.mocked" class="mock-notice">
+              <small>💡 当前显示模拟数据，配置 TAPD 后可获取真实筛选选项</small>
+            </div>
+          </div>
+
+          <!-- TAPD 浏览布局：左侧目录树 + 右侧内容 -->
+          <div class="tapd-browser">
+            <aside class="module-tree-panel">
+              <div class="tree-header">
+                <span>用例目录</span>
+                <button class="tree-reset" @click="selectModule('', '所有模块')">重置</button>
+              </div>
+              <div class="tree-scroll">
+                <div class="tree-item" @click="selectModule('', '所有模块')">
+                  <span class="tree-label" :class="{ selected: !tapdFilters.module }">所有模块</span>
+                </div>
+                <div v-for="module in rootModules" :key="module.id" class="tree-item">
+                  <div 
+                    class="tree-node" 
+                    :class="{ expanded: expandedModules.has(module.id) }"
+                    @click="toggleModule(module)"
+                  >
+                    <span v-if="module.children && module.children.length > 0" class="tree-toggle">
+                      {{ expandedModules.has(module.id) ? '▼' : '▶' }}
+                    </span>
+                    <span 
+                      class="tree-label" 
+                      :class="{ selected: tapdFilters.module === module.id }"
+                      @click.stop="selectModule(module.id, module.name)"
+                    >
+                      {{ module.name }}
+                    </span>
+                  </div>
+                  <div v-if="module.children && module.children.length > 0 && expandedModules.has(module.id)" class="tree-children">
+                    <div 
+                      v-for="child in module.children" 
+                      :key="child.id"
+                      class="tree-item child"
+                    >
+                      <div 
+                        class="tree-node" 
+                        :class="{ expanded: expandedModules.has(child.id) }"
+                        @click="toggleModule(child)"
+                      >
+                        <span v-if="child.children && child.children.length > 0" class="tree-toggle">
+                          {{ expandedModules.has(child.id) ? '▼' : '▶' }}
+                        </span>
+                        <span 
+                          class="tree-label" 
+                          :class="{ selected: tapdFilters.module === child.id }"
+                          @click.stop="selectModule(child.id, child.name)"
+                        >
+                          {{ child.name }}
+                        </span>
+                      </div>
+                      <div v-if="child.children && child.children.length > 0 && expandedModules.has(child.id)" class="tree-children">
+                        <div 
+                          v-for="grandChild in child.children" 
+                          :key="grandChild.id"
+                          class="tree-item grandchild"
+                        >
+                          <span 
+                            class="tree-label" 
+                            :class="{ selected: tapdFilters.module === grandChild.id }"
+                            @click="selectModule(grandChild.id, grandChild.name)"
+                          >
+                            {{ grandChild.name }}
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </aside>
+
+            <section class="tapd-content">
+              <div v-if="tapdTestCases.length > 0" class="testcase-list">
+                <h3>选择测试用例 <small v-if="selectedTapdTestCases.length">（已选 {{ selectedTapdTestCases.length }} 项）</small></h3>
+                <div class="list-toolbar">
+                  <button class="btn sm" @click="selectAllVisible">全选当前页</button>
+                  <button class="btn sm" @click="invertSelectionVisible">反选</button>
+                  <button class="btn sm ghost" :disabled="selectedTapdTestCases.length===0" @click="clearSelected">清空已选</button>
+                </div>
+                <div class="testcase-grid">
+                  <div 
+                    v-for="testCase in tapdTestCases" 
+                    :key="testCase.id"
+                    class="testcase-card"
+                    :class="{ selected: selectedTapdTestCase?.id === testCase.id, 'selected-multi': isSelected(testCase) }"
+                    @click="selectTapdTestCase(testCase)"
+                  >
+                    <label class="select-checkbox" @click.stop>
+                      <input type="checkbox" :checked="isSelected(testCase)" @change="toggleSelect(testCase)" />
+                      <span></span>
+                    </label>
+                    <div class="testcase-header">
+                      <h4>{{ testCase.title }}</h4>
+                      <span class="priority-badge" :class="`priority-${testCase.priority}`">
+                        {{ getPriorityText(testCase.priority) }}
+                      </span>
+                    </div>
+                    <p class="testcase-desc">{{ testCase.description }}</p>
+                    <div class="testcase-meta">
+                      <span class="module">{{ testCase.module }}</span>
+                      <span class="owner">{{ testCase.owner }}</span>
+                      <span v-if="testCase.mocked" class="mock-badge">模拟数据</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div v-if="selectedTapdTestCase" class="selected-testcase">
+                <h3>测试用例详情</h3>
+                <div class="testcase-detail">
+                  <div class="detail-header">
+                    <h4>{{ selectedTapdTestCase.title }}</h4>
+                    <a v-if="selectedTapdTestCase.url" :href="selectedTapdTestCase.url" target="_blank" class="tapd-link">
+                      在 TAPD 中查看
+                    </a>
+                  </div>
+                  <p class="detail-desc">{{ selectedTapdTestCase.description }}</p>
+                  <div v-if="selectedTapdTestCase.steps.length > 0" class="test-steps">
+                    <h5>测试步骤</h5>
+                    <ol class="steps-list">
+                      <li v-for="step in selectedTapdTestCase.steps" :key="step.step" class="step-item">
+                        <div class="step-action">{{ step.action }}</div>
+                        <div v-if="step.expected" class="step-expected">期望：{{ step.expected }}</div>
+                      </li>
+                    </ol>
+                  </div>
+                  <div v-if="selectedTapdTestCase.expectedResult" class="expected-section">
+                    <h5>预期结果</h5>
+                    <div class="expected-content">{{ selectedTapdTestCase.expectedResult }}</div>
+                  </div>
+                  <div class="page-info-section">
+                    <h5>页面信息</h5>
+                    <div class="form-group">
+                      <label>页面名称 *</label>
+                      <input 
+                        v-model="tapdPageInfo.pageName" 
+                        type="text" 
+                        :placeholder="`例如: ${selectedTapdTestCase.module}页面`"
+                      />
+                    </div>
+                    <div class="form-group">
+                      <label>页面URL *</label>
+                      <input 
+                        v-model="tapdPageInfo.pageUrl" 
+                        type="text" 
+                        placeholder="例如: /finance/deposit"
+                      />
+                    </div>
+                    <div class="form-group">
+                      <label>页面描述</label>
+                      <textarea 
+                        v-model="tapdPageInfo.pageDescription" 
+                        placeholder="描述该页面的主要功能和特点"
+                        rows="3"
+                      ></textarea>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div v-else-if="!loadingTapd && tapdTestCases.length === 0" class="empty-state">
+                <p>暂无测试用例，请检查 TAPD 配置或筛选条件</p>
+              </div>
+            </section>
           </div>
         </div>
 
@@ -292,7 +476,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 
 interface UploadedFile {
   name: string
@@ -307,7 +491,7 @@ interface ManualInput {
   testCaseBody?: string
 }
 
-const inputMethod = ref<'file' | 'manual'>('file')
+const inputMethod = ref<'tapd' | 'manual' | 'file'>('tapd')
 const uploadedFiles = ref<Record<string, UploadedFile>>({})
 const manualInput = ref<ManualInput>({
   pageName: '',
@@ -341,13 +525,84 @@ let analyzingPhaseIndex = 0; void analyzingPhaseIndex
 const testCaseFileInput = ref<HTMLInputElement>()
 const screenshotFileInput = ref<HTMLInputElement>()
 
-const canGenerate = computed(() => {
-  if (inputMethod.value === 'file') {
-    return uploadedFiles.value.testCase && uploadedFiles.value.screenshot
-  } else {
-    return manualInput.value.pageName && manualInput.value.pageUrl
-  }
+// TAPD 相关
+interface TapdTestCase {
+  id: string
+  title: string
+  description: string
+  steps: Array<{ step: number; action: string; expected: string }>
+  expectedResult: string
+  priority: number
+  status: string
+  module: string
+  owner: string
+  created: string
+  modified: string
+  url: string
+  mocked?: boolean
+  raw?: any
+}
+
+interface TapdFilters {
+  module: string
+}
+
+interface TapdPageInfo {
+  pageName: string
+  pageUrl: string
+  pageDescription: string
+}
+
+const tapdTestCases = ref<TapdTestCase[]>([])
+const selectedTapdTestCase = ref<TapdTestCase | null>(null)
+const selectedTapdTestCases = ref<TapdTestCase[]>([])
+const loadingTapd = ref(false)
+const loadingFilters = ref(false)
+const tapdFilters = ref<TapdFilters>({
+  module: ''
 })
+const tapdPageInfo = ref<TapdPageInfo>({
+  pageName: '',
+  pageUrl: '',
+  pageDescription: ''
+})
+
+// 筛选选项
+interface FilterOption {
+  id: string
+  name: string
+  parent_id?: string
+  children?: FilterOption[]
+}
+
+interface FilterOptions {
+  modules: FilterOption[]
+  statuses: FilterOption[]
+  owners: FilterOption[]
+  mocked?: boolean
+}
+
+const filterOptions = ref<FilterOptions>({
+  modules: [],
+  statuses: [],
+  owners: []
+})
+
+// 层级展示相关数据
+const showModuleDropdown = ref(false)
+const selectedModuleName = ref('')
+const expandedModules = ref(new Set<string>())
+
+// 计算根级模块：parent_id 为空或其 parent_id 不在模块 id 集合中
+const rootModules = computed(() => {
+  const modules = filterOptions.value.modules || []
+  if (!modules.length) return []
+
+  const idSet = new Set(modules.map(m => m.id))
+  return modules.filter(m => !m.parent_id || !idSet.has(m.parent_id))
+})
+
+
 
 // 按用例分组的规则数据
 const groupedRules = computed(() => {
@@ -584,13 +839,29 @@ async function generateTestCode() {
     ruleSummary.value = { steps: [], expects: [] } // 重置规则摘要
 
     // 使用流式接口，实时接收AI思考/步骤
+    // 仅发送精简的 TAPD 用例字段，避免请求体过大
+    const selectedList = selectedTapdTestCases.value.length > 0 
+      ? selectedTapdTestCases.value 
+      : (selectedTapdTestCase.value ? [selectedTapdTestCase.value] : [])
+    const slimSelected = selectedList.map(tc => ({
+      id: tc.id,
+      title: tc.title,
+      module: tc.module,
+      expectedResult: tc.expectedResult,
+      steps: (tc.steps || []).map(s => ({ step: s.step, action: s.action, expected: s.expected }))
+    }))
+    const selectedMeta = selectedList.map(tc => ({ id: tc.id, title: tc.title }))
+
     const response = await fetch('http://localhost:3002/api/generate-test-stream', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         inputMethod: inputMethod.value,
         files: uploadedFiles.value,
-        manualInput: manualInput.value
+        manualInput: manualInput.value,
+        tapdPageInfo: tapdPageInfo.value,
+        tapdSelected: slimSelected,
+        tapdSelectedMeta: selectedMeta
       })
     })
 
@@ -843,10 +1114,190 @@ function copyCode() {
   navigator.clipboard.writeText(generatedCode.value)
   alert('代码已复制到剪贴板')
 }
+
+// TAPD 相关方法
+async function loadFilterOptions() {
+  try {
+    loadingFilters.value = true
+    const response = await fetch('http://localhost:3002/api/tapd/filter-options')
+    const data = await response.json()
+    
+    if (data.success) {
+      filterOptions.value = data.data
+      console.log('加载的筛选选项:', filterOptions.value)
+    } else {
+      console.error('加载筛选选项失败:', data.error)
+    }
+  } catch (error) {
+    console.error('加载筛选选项失败:', error)
+  } finally {
+    loadingFilters.value = false
+  }
+}
+
+async function loadTapdTestCases() {
+  try {
+    loadingTapd.value = true
+    const params = new URLSearchParams()
+    
+    if (tapdFilters.value.module) params.append('module', tapdFilters.value.module)
+    
+    const response = await fetch(`http://localhost:3002/api/tapd/testcases?${params}`)
+    const data = await response.json()
+    
+    if (data.success) {
+      tapdTestCases.value = data.data
+      console.log('加载的测试用例:', tapdTestCases.value)
+    } else {
+      alert(`加载失败: ${data.error}`)
+    }
+  } catch (error) {
+    console.error('加载 TAPD 测试用例失败:', error)
+    alert('加载失败，请检查网络连接')
+  } finally {
+    loadingTapd.value = false
+  }
+}
+
+function selectTapdTestCase(testCase: TapdTestCase) {
+  selectedTapdTestCase.value = testCase
+  
+  // 自动填充页面信息
+  tapdPageInfo.value.pageName = `${testCase.module}页面` || '测试页面'
+  tapdPageInfo.value.pageUrl = `/${testCase.module.toLowerCase()}` || '/test'
+  tapdPageInfo.value.pageDescription = testCase.description || ''
+}
+
+function isSelected(testCase: TapdTestCase) {
+  return selectedTapdTestCases.value.some(t => t.id === testCase.id)
+}
+
+function toggleSelect(testCase: TapdTestCase) {
+  const idx = selectedTapdTestCases.value.findIndex(t => t.id === testCase.id)
+  if (idx >= 0) {
+    selectedTapdTestCases.value.splice(idx, 1)
+  } else {
+    selectedTapdTestCases.value.push(testCase)
+    // 若是首次多选或页面信息为空，自动填充
+    if (!selectedTapdTestCase.value) {
+      selectedTapdTestCase.value = testCase
+    }
+    if (!tapdPageInfo.value.pageName) {
+      tapdPageInfo.value.pageName = `${testCase.module}页面`
+    }
+    if (!tapdPageInfo.value.pageUrl) {
+      tapdPageInfo.value.pageUrl = `/${testCase.module.toLowerCase()}`
+    }
+  }
+}
+
+function selectAllVisible() {
+  const idSet = new Set(selectedTapdTestCases.value.map(t => t.id))
+  tapdTestCases.value.forEach(tc => {
+    if (!idSet.has(tc.id)) selectedTapdTestCases.value.push(tc)
+  })
+  // 自动选中第一个并填充页面信息，确保生成按钮可用
+  if (!selectedTapdTestCase.value && tapdTestCases.value.length) {
+    selectedTapdTestCase.value = tapdTestCases.value[0]
+  }
+  if (!tapdPageInfo.value.pageName && tapdTestCases.value.length) {
+    const tc = tapdTestCases.value[0]
+    tapdPageInfo.value.pageName = `${tc.module}页面`
+    tapdPageInfo.value.pageUrl = `/${tc.module.toLowerCase()}`
+    tapdPageInfo.value.pageDescription = tc.description || ''
+  }
+}
+
+function invertSelectionVisible() {
+  const currentIds = new Set(selectedTapdTestCases.value.map(t => t.id))
+  const nextSelected: TapdTestCase[] = []
+  tapdTestCases.value.forEach(tc => {
+    if (!currentIds.has(tc.id)) nextSelected.push(tc)
+  })
+  selectedTapdTestCases.value = nextSelected
+  // 重置选中详情为第一条，保持页面可生成
+  if (nextSelected.length > 0) {
+    const tc = nextSelected[0]
+    selectedTapdTestCase.value = tc
+    tapdPageInfo.value.pageName ||= `${tc.module}页面`
+    tapdPageInfo.value.pageUrl ||= `/${tc.module.toLowerCase()}`
+    tapdPageInfo.value.pageDescription ||= tc.description || ''
+  }
+}
+
+function clearSelected() {
+  selectedTapdTestCases.value = []
+}
+
+function getPriorityText(priority: number): string {
+  const map: Record<number, string> = {
+    1: '紧急',
+    2: '高',
+    3: '中',
+    4: '低'
+  }
+  return map[priority] || '中'
+}
+
+// 更新 canGenerate 计算属性以支持 TAPD（若多选则也允许生成）
+const canGenerate = computed(() => {
+  if (inputMethod.value === 'file') {
+    return uploadedFiles.value.testCase && uploadedFiles.value.screenshot
+  } else if (inputMethod.value === 'tapd') {
+    return (selectedTapdTestCase.value || selectedTapdTestCases.value.length > 0) && tapdPageInfo.value.pageName && tapdPageInfo.value.pageUrl
+  } else {
+    return manualInput.value.pageName && manualInput.value.pageUrl
+  }
+})
+
+// 层级展示相关方法
+function toggleModuleDropdown() {
+  showModuleDropdown.value = !showModuleDropdown.value
+}
+
+function selectModule(moduleName: string, displayName: string) {
+  tapdFilters.value.module = moduleName
+  selectedModuleName.value = displayName
+  showModuleDropdown.value = false
+}
+
+function toggleModule(module: any) {
+  if (module.children && module.children.length > 0) {
+    if (expandedModules.value.has(module.id)) {
+      expandedModules.value.delete(module.id)
+    } else {
+      expandedModules.value.add(module.id)
+    }
+  }
+}
+
+// 点击外部关闭下拉框
+function handleClickOutside(event: Event) {
+  const target = event.target as HTMLElement
+  if (!target.closest('.module-selector')) {
+    showModuleDropdown.value = false
+  }
+}
+
+// 监听输入方式变化，自动加载筛选选项
+watch(inputMethod, (newMethod) => {
+  if (newMethod === 'tapd' && filterOptions.value.modules.length === 0) {
+    loadFilterOptions()
+  }
+}, { immediate: true })
+
+// 添加点击外部关闭下拉框的事件监听器
+onMounted(() => {
+  document.addEventListener('click', handleClickOutside)
+})
+
+onUnmounted(() => {
+  document.removeEventListener('click', handleClickOutside)
+})
 </script>
 
 <style scoped>
-.create-test-container { max-width: 1280px; margin: 0 auto; padding: 0 24px 24px; }
+.create-test-container { max-width: 100%; width: 100%; margin: 0; padding: 0 24px 24px; }
 
 .page-header { display: flex; align-items: baseline; gap: 12px; padding: 20px 8px; }
 .page-header h1 { font-size: 28px; color: #111827; margin: 0; font-weight: 700; }
@@ -854,7 +1305,7 @@ function copyCode() {
 
 .main-content { display: grid; gap: 16px; }
 
-.two-cols { grid-template-columns: 1fr 420px; align-items: start; }
+.two-cols { grid-template-columns: 1.2fr 420px; align-items: start; }
 
 .left-col { display: none; }
 
@@ -1052,6 +1503,8 @@ function copyCode() {
 .btn { border: 0; padding: 8px 12px; border-radius: 8px; cursor: pointer; }
 .btn.ghost { background: #f3f4f6; color: #374151; }
 .btn.primary { background: #3b82f6; color: white; }
+.btn.sm { font-size: 12px; padding: 6px 10px; border: 1px solid #e5e7eb; background: #fff; }
+.btn.sm.ghost { background: #f9fafb; }
 .rule-list { list-style: none; padding: 0; margin: 0; }
 .rule-list li { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-bottom: 1px dashed #eef2f7; }
 .rule-list li .text { flex: 1; color: #374151; }
@@ -1262,5 +1715,414 @@ function copyCode() {
   font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
   font-size: 0.8rem;
   line-height: 1.4;
+}
+
+/* TAPD 导入相关样式 */
+.tapd-import-section {
+  display: grid;
+  gap: 24px;
+}
+
+.tapd-browser { display: grid; grid-template-columns: 320px 1fr; gap: 16px; }
+
+.module-tree-panel {
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  background: #fff;
+  overflow: hidden;
+}
+
+.tree-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 12px;
+  background: #f8fafc;
+  border-bottom: 1px solid #eef2f7;
+  font-weight: 600;
+  color: #111827;
+}
+
+.tree-reset {
+  border: 1px solid #d1d5db;
+  background: white;
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.tree-scroll { height: calc(100vh - 340px); overflow: auto; }
+
+.tapd-content { min-height: calc(100vh - 340px); }
+
+.filter-row {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.filter-select {
+  padding: 8px 12px;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  font-size: 0.875rem;
+  min-width: 120px;
+}
+
+/* 层级模块选择器样式 */
+.module-selector {
+  position: relative;
+  min-width: 200px;
+}
+
+.module-dropdown {
+  padding: 8px 12px;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  background: white;
+  cursor: pointer;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  user-select: none;
+  font-size: 0.875rem;
+}
+
+.module-dropdown:hover {
+  border-color: #3b82f6;
+}
+
+.module-dropdown.open {
+  border-color: #3b82f6;
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
+}
+
+.selected-module {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dropdown-arrow {
+  margin-left: 8px;
+  transition: transform 0.2s;
+  font-size: 12px;
+  color: #6b7280;
+}
+
+.module-dropdown.open .dropdown-arrow {
+  transform: rotate(180deg);
+}
+
+.module-tree {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  background: white;
+  border: 1px solid #3b82f6;
+  border-top: none;
+  border-radius: 0 0 6px 6px;
+  max-height: 300px;
+  overflow-y: auto;
+  z-index: 1000;
+  box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+}
+
+.tree-item {
+  padding: 8px 12px;
+  cursor: pointer;
+  border-bottom: 1px solid #f3f4f6;
+  font-size: 0.875rem;
+}
+
+.tree-item:last-child {
+  border-bottom: none;
+}
+
+.tree-item:hover { background: #f5faff; }
+
+.tree-item.child { padding-left: 28px; background: transparent; }
+
+.tree-item.grandchild { padding-left: 44px; background: transparent; }
+
+.tree-node {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 0;
+}
+
+.tree-toggle {
+  width: 16px;
+  text-align: center;
+  font-size: 12px;
+  color: #6b7280;
+  user-select: none;
+}
+
+.tree-label {
+  flex: 1;
+  padding: 4px 6px;
+  border-radius: 6px;
+}
+
+.tree-label.selected {
+  color: #1d4ed8;
+  font-weight: 600;
+  background: #e8f0ff;
+}
+
+.tree-children {
+  background: transparent;
+  border-left: 2px solid #f1f5f9;
+  margin-left: 8px;
+}
+
+.load-btn {
+  padding: 8px 16px;
+  background: #3b82f6;
+  color: white;
+  border: none;
+  border-radius: 6px;
+  font-size: 0.875rem;
+  cursor: pointer;
+  transition: background-color 0.2s;
+}
+
+.load-btn:hover:not(:disabled) {
+  background: #2563eb;
+}
+
+.load-btn:disabled {
+  background: #9ca3af;
+  cursor: not-allowed;
+}
+
+.testcase-list {
+  margin-top: 16px;
+}
+
+.list-toolbar { display: flex; gap: 8px; margin: 8px 0 0 0; }
+
+.testcase-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 16px;
+  margin-top: 16px;
+}
+
+.testcase-card {
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  padding: 16px;
+  cursor: pointer;
+  transition: all 0.2s;
+  background: white;
+  position: relative;
+}
+
+.testcase-card:hover {
+  border-color: #3b82f6;
+  box-shadow: 0 2px 8px rgba(59, 130, 246, 0.1);
+}
+
+.testcase-card.selected {
+  border-color: #3b82f6;
+  background: #f8fafc;
+  box-shadow: 0 2px 8px rgba(59, 130, 246, 0.15);
+}
+
+.testcase-card.selected-multi {
+  outline: 2px solid #3b82f6;
+}
+
+.testcase-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: 8px;
+}
+
+.testcase-header h4 {
+  margin: 0;
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: #111827;
+  flex: 1;
+  margin-right: 8px;
+}
+
+.priority-badge {
+  padding: 2px 8px;
+  border-radius: 12px;
+  font-size: 0.75rem;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.select-checkbox {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.select-checkbox input {
+  width: 16px;
+  height: 16px;
+}
+
+.priority-1 { background: #fef2f2; color: #dc2626; }
+.priority-2 { background: #fef3c7; color: #d97706; }
+.priority-3 { background: #dbeafe; color: #2563eb; }
+.priority-4 { background: #f3f4f6; color: #6b7280; }
+
+.testcase-desc {
+  margin: 8px 0;
+  font-size: 0.8rem;
+  color: #6b7280;
+  line-height: 1.4;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.testcase-meta {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  font-size: 0.75rem;
+  color: #9ca3af;
+}
+
+.testcase-meta span {
+  padding: 2px 6px;
+  background: #f3f4f6;
+  border-radius: 4px;
+}
+
+.mock-badge {
+  background: #fef3c7 !important;
+  color: #d97706 !important;
+}
+
+.selected-testcase {
+  margin-top: 24px;
+  padding: 20px;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  background: #f9fafb;
+}
+
+.detail-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: 12px;
+}
+
+.detail-header h4 {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 600;
+  color: #111827;
+  flex: 1;
+}
+
+.tapd-link {
+  color: #3b82f6;
+  text-decoration: none;
+  font-size: 0.875rem;
+  padding: 4px 8px;
+  border: 1px solid #3b82f6;
+  border-radius: 4px;
+  transition: all 0.2s;
+}
+
+.tapd-link:hover {
+  background: #3b82f6;
+  color: white;
+}
+
+.detail-desc {
+  margin: 12px 0;
+  color: #6b7280;
+  line-height: 1.5;
+}
+
+.test-steps {
+  margin: 16px 0;
+}
+
+.test-steps h5 {
+  margin: 0 0 12px 0;
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: #374151;
+}
+
+.steps-list {
+  margin: 0;
+  padding-left: 20px;
+}
+
+.step-item {
+  margin-bottom: 8px;
+  line-height: 1.4;
+}
+
+.step-action {
+  font-size: 0.875rem;
+  color: #111827;
+}
+
+.step-expected {
+  font-size: 0.8rem;
+  color: #6b7280;
+  margin-top: 2px;
+  font-style: italic;
+}
+
+.expected-section { margin: 16px 0; }
+.expected-section h5 { margin: 0 0 12px 0; font-size: 0.875rem; font-weight: 600; color: #374151; }
+.expected-content { padding: 12px; background: #f8fafc; border: 1px solid #e5e7eb; border-radius: 6px; color: #374151; }
+
+.page-info-section {
+  margin-top: 20px;
+  padding-top: 20px;
+  border-top: 1px solid #e5e7eb;
+}
+
+.page-info-section h5 {
+  margin: 0 0 16px 0;
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: #374151;
+}
+
+.empty-state {
+  text-align: center;
+  padding: 40px 20px;
+  color: #6b7280;
+  font-size: 0.875rem;
+}
+
+.mock-notice {
+  margin-top: 8px;
+  padding: 8px 12px;
+  background: #fef3c7;
+  border: 1px solid #f59e0b;
+  border-radius: 6px;
+  color: #92400e;
+  font-size: 0.8rem;
 }
 </style>
