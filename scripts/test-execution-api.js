@@ -6,6 +6,7 @@ const { exec, spawn } = require('child_process');
 const LLMTestExecutor = require('./llm-executor.js');
 
 const app = express();
+const DirectExecutor = require('./direct-executor');
 const { TapdProvider } = require('./bug-provider');
 
 // 服务器配置
@@ -75,9 +76,12 @@ app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 // 为了简单的SSE解析，关闭express默认缓存
 app.set('x-powered-by', false);
+// 静态资源：暴露测试产物，供前端预览帧/视频
+app.use('/assets', require('express').static(path.join(__dirname, '..')));
 
 // 测试执行器实例
 const testExecutor = new LLMTestExecutor();
+const directExecutor = new DirectExecutor();
 
 // 运行统计 - 持久化到文件
 const RUN_COUNT_FILE = path.join(__dirname, '../test-results/run-counts.json');
@@ -180,13 +184,18 @@ function parseMarkdownTestCases(markdown) {
   for (const raw of lines) {
     // 预清洗：去掉 Markdown 粗体/行内代码等轻量标记，统一全角冒号
     let line = raw.trim();
+    if (!line) { mode = null; continue; }
+    
+    // 先检查是否是区块标识（在清洗之前）
+    if (/^\*\*预期结果\*\*[:：]?$/i.test(line)) { mode = 'expects'; continue; }
+    if (/^\*\*步(骤|驟)\*\*[:：]?$/i.test(line)) { mode = 'steps'; continue; }
+    
+    // 然后进行清洗
     line = line.replace(/\*\*(.*?)\*\*/g, '$1'); // **粗体** → 文本
     line = line.replace(/\`([^`]*)\`/g, '$1');     // `行内代码` → 文本
     line = line.replace(/[：:]\s*$/g, '：');        // 结尾统一成全角冒号
     line = line.replace(/^\s*[•·]\s*/g, '- ');      // • / · 前缀 → -
     if (!line) { mode = null; continue; }
-    
-    console.log('🔍 处理行:', line, '当前模式:', mode);
 
     // 分段标题（多模式）
     const titleMatchers = [
@@ -214,6 +223,9 @@ function parseMarkdownTestCases(markdown) {
   
   // 新增：识别"预期结果:"格式
   if (/^预期结果[:：]?$/i.test(line)) { mode = 'expects'; continue; }
+  
+  // 新增：识别"**预期结果**"格式
+  if (/^\*\*预期结果\*\*[:：]?$/i.test(line)) { mode = 'expects'; continue; }
 
     // 可选标题行：标题：xxx
     const mTitle = line.match(/^(标题|Title)[:：]\s*(.*)$/i);
@@ -233,6 +245,12 @@ function parseMarkdownTestCases(markdown) {
       continue;
     }
     if (stepByNumber) { current.steps.push(stepByNumber[1].trim()); continue; }
+    
+    // 预期结果：有数字或短横线或处于 expects 模式
+    if (mode === 'expects' && (stepByNumber || stepByDash)) {
+      current.expects.push((stepByNumber ? stepByNumber[1] : stepByDash[1]).trim());
+      continue;
+    }
     
     // 新增：处理没有空格的数字步骤格式（如"1.进入页面"）
     const stepByNumberNoSpace = line.match(/^(\d+[\.)])(.+)$/);
@@ -267,16 +285,30 @@ function parseMarkdownTestCases(markdown) {
 // 将中文步骤映射为可执行代码（启发式）
 function mapStepToCode(step, ruleSummary) {
   if (!step) return null;
-  const s = step.trim();
+  const normalizeText = (txt) => String(txt || '')
+    .replace(/[""]/g, '"')
+    .replace(/['']/g, "'")
+    .replace(/\s+/g, ' ')
+    .replace(/弹窗中的|在弹出的.*?弹窗中|在.*?弹窗中|在页面中|在该页面中/g, '')
+    .trim();
+  const cleanName = (name) => String(name || '')
+    .replace(/["""]/g, '')
+    .replace(/["']/g, '')
+    .replace(/^(按钮|菜单|选项|链接)：?/, '')
+    .replace(/^["']|["']$/g, '') // 去除首尾引号
+    .replace(/^[，,、]\s*/g, '') // 去除开头的逗号和空格
+    .trim();
+  const s = normalizeText(step);
+  
   // 以"验证/校验"开头的步骤，转由预期规则处理
   if (/^(验证|校验)/.test(s)) {
     const mapped = mapExpectToCode(s.replace(/^(验证|校验)/, ''), ruleSummary);
     if (mapped) {
       ruleSummary.steps.push({ text: s, rule: 'mapped-to-expect', hit: true });
-      // 直接返回断言代码，而不是让上层回退生成注释
       return mapped;
     }
   }
+  
   // 导航类
   if (/进入|打开/.test(s) && /页面/.test(s)) {
     ruleSummary.steps.push({ text: s, rule: 'navigate-page', hit: true });
@@ -288,47 +320,287 @@ function mapStepToCode(step, ruleSummary) {
     ruleSummary.steps.push({ text: s, rule: 'navigate-management-page', hit: true });
     return `// 已在测试内置跳转至页面`;
   }
+  
   // 点击按钮
-  const clickBtn = s.match(/点击[""']?(.+?)[""']?按钮/);
+  const clickBtn = s.match(/点击(?:.*?)["'](.+?)["'](?:按钮)?/) || s.match(/点击(.+?)(?:按钮|$)/);
   if (clickBtn) {
-    const name = clickBtn[1];
+    const name = cleanName(clickBtn[1] || clickBtn[0].replace(/^点击/, ''));
     ruleSummary.steps.push({ text: s, rule: 'click-button-by-name', hit: true });
-    return `await page.getByRole('button', { name: '${name}' }).click();`;
+    if (/^(确定|确认|保存|保 存)$/.test(name)) return `await clickOk(page);`;
+    return `await page.getByRole('button', { name: ${JSON.stringify(name)} }).first().click();`;
   }
+  
   // 点击"确定/取消/X"
   if (/点击["']?确定["']?/.test(s)) { ruleSummary.steps.push({ text: s, rule: 'click-confirm', hit: true }); return `await page.getByRole('button', { name: /^(确定|确认|保 存|保存)$/ }).click();`; }
   if (/点击[""']?取消[""']?/.test(s)) { ruleSummary.steps.push({ text: s, rule: 'click-cancel', hit: true }); return `await page.getByRole('button', { name: '取消' }).click();`; }
   if (/右上角.*["']?X[""']?/.test(s)) return `await page.locator('.ant-modal-close').click();`;
+  
   // 勾选/选择某个选项（通用，适配 radio/checkbox/label）
   const chooseOpt = s.match(/(勾选|选择|点击)["'](.+?)["']/);
   if (chooseOpt) {
-    const label = chooseOpt[2];
+    const label = cleanName(chooseOpt[2]);
     ruleSummary.steps.push({ text: s, rule: 'choose-option-by-label', hit: true });
-    return `await page.locator('.ant-modal-content').locator('label:has-text("${label}"), .ant-radio-wrapper:has-text("${label}"), .ant-checkbox-wrapper:has-text("${label}")').first().click();`;
+    return `await clickOptionByText(page, '${label}');`;
   }
+  
   // 文本输入：如 "在XXX中输入'YYY'" 或 "输入'YYY'到XXX"
-  const inputToField = s.match(/(在|向)?([\u4e00-\u9fa5A-Za-z0-9_\s"'']+?)(输入框|文本框|输入栏|字段|中|里)?(输入|填写)["'](.+?)["']/);
-  const fillValueFirst = s.match(/(输入|填写)["'](.+?)[""'].*(到|至|到达|在)(.+?)(中|里)?$/);
+  const inputToField = s.match(/(在|向)?([\u4e00-\u9fa5A-Za-z0-9_\s"']+?)(输入框|文本框|输入栏|字段|中|里)?(输入|填写)["'](.+?)["']/);
+  const fillValueFirst = s.match(/(输入|填写)["'](.+?)["'].*?(到|至|到达|在)(.+?)(中|里)?$/);
   if (inputToField || fillValueFirst) {
-    const labelText = (inputToField ? inputToField[2] : (fillValueFirst ? fillValueFirst[4] : '')).replace(/["']/g, '').trim();
+    const labelText = cleanName(inputToField ? inputToField[2] : (fillValueFirst ? fillValueFirst[4] : ''));
     const value = (inputToField ? inputToField[5] : (fillValueFirst ? fillValueFirst[2] : '')) || '';
     const v = value || '示例文本';
     ruleSummary.steps.push({ text: s, rule: 'fill-input-by-label', hit: true });
+    const varName = `${labelText.replace(/[\s"'，,。:：]/g, '')}Input`;
+    if (/释义/.test(labelText)) {
+      return (
+        `const ${varName} = await typeTextarea(page, ${JSON.stringify(value || '示例文本')});\n` +
+        `await assertValueContains(${varName}, ${JSON.stringify(value || '示例文本')});`
+      );
+    }
     return (
-      `{\n` +
-      `  const targetInput = page.locator('.ant-modal-content .ant-form-item:has(label:has-text("${labelText}"))').locator('input:not([type="hidden"]), textarea').first();\n` +
-      `  await targetInput.scrollIntoViewIfNeeded();\n` +
-      `  await targetInput.click();\n` +
-      `  await targetInput.fill('');\n` +
-      `  await targetInput.type(${JSON.stringify(value || '示例文本')}, { delay: 10 });\n` +
-      `}`
+      `const ${varName} = await typeByLabel(page, '${labelText}', ${JSON.stringify(value || '示例文本')});\n` +
+      `await assertValueContains(${varName}, ${JSON.stringify(value || '示例文本')});`
     );
   }
+  
+  // 新增：处理"向XXX输入框中输入YYY"格式
+  const inputToField2 = s.match(/向["']?([^"']+?)["']?输入框中输入["']?([^"']+?)["']?/);
+  if (inputToField2) {
+    const fieldName = cleanName(inputToField2[1]);
+    const value = inputToField2[2];
+    ruleSummary.steps.push({ text: s, rule: 'fill-input-by-field-name', hit: true });
+    const varName = `${fieldName.replace(/[\s"'，,。:：]/g, '')}Input`;
+    if (/释义/.test(fieldName)) {
+      return (
+        `const ${varName} = await typeTextarea(page, ${JSON.stringify(value)});\n` +
+        `await assertValueContains(${varName}, ${JSON.stringify(value)});`
+      );
+    }
+    return (
+      `const ${varName} = await typeByLabel(page, '${fieldName}', ${JSON.stringify(value)});\n` +
+      `await assertValueContains(${varName}, ${JSON.stringify(value)});`
+    );
+  }
+  
+  // 新增：处理"在XXX中，YYY输入框中输入：ZZZ"格式
+  const inputInFieldWithColon = s.match(/在["']?([^"']+?)["']?中，([^"']+?)输入框中输入：([^"']+?)[。.]?$/);
+  if (inputInFieldWithColon) {
+    const context = cleanName(inputInFieldWithColon[1]);
+    const fieldName = cleanName(inputInFieldWithColon[2]);
+    const value = inputInFieldWithColon[3];
+    ruleSummary.steps.push({ text: s, rule: 'fill-input-in-field-with-colon', hit: true });
+    const varName = `${fieldName.replace(/[\s"'，,。:：]/g, '')}Input`;
+    if (/金额/.test(fieldName)) {
+      return (
+        `const ${varName} = await typeAmount(page, ${JSON.stringify(value)});\n` +
+        `await assertValueContains(${varName}, ${JSON.stringify(value)});`
+      );
+    }
+    if (/释义/.test(fieldName)) {
+      return (
+        `const ${varName} = await typeTextarea(page, ${JSON.stringify(value)});\n` +
+        `await assertValueContains(${varName}, ${JSON.stringify(value)});`
+      );
+    }
+    return (
+      `const ${varName} = await typeByLabel(page, '${fieldName}', ${JSON.stringify(value)});\n` +
+      `await assertValueContains(${varName}, ${JSON.stringify(value)});`
+    );
+  }
+  
+  // 新增：处理"在XXX选项中，选择YYY"格式
+  const selectOptionInContext = s.match(/在["']?([^"']+?)["']?选项中，选择["']?([^"']+?)["']?[。.]?$/);
+  if (selectOptionInContext) {
+    const context = cleanName(selectOptionInContext[1]);
+    const optionName = cleanName(selectOptionInContext[2]);
+    ruleSummary.steps.push({ text: s, rule: 'select-option-in-context', hit: true });
+    return `await clickOptionByText(page, '${optionName}');`;
+  }
+  
+  // 新增：处理"在XXX对应的YYY输入框中，输入：ZZZ"格式
+  const inputInCorrespondingFieldWithColon = s.match(/在["']?([^"']+?)["']?对应的([^"']+?)输入框中，输入：([^"']+?)[。.]?$/);
+  if (inputInCorrespondingFieldWithColon) {
+    const optionName = cleanName(inputInCorrespondingFieldWithColon[1]);
+    const fieldName = cleanName(inputInCorrespondingFieldWithColon[2]);
+    const value = inputInCorrespondingFieldWithColon[3];
+    ruleSummary.steps.push({ text: s, rule: 'fill-input-in-corresponding-field-with-colon', hit: true });
+    const varName = `${fieldName.replace(/[\s"'，,。:：]/g, '')}Input`;
+    if (/金额/.test(fieldName)) {
+      return (
+        `const ${varName} = await typeAmount(page, ${JSON.stringify(value)});\n` +
+        `await assertValueContains(${varName}, ${JSON.stringify(value)});`
+      );
+    }
+    if (/释义/.test(fieldName)) {
+      return (
+        `const ${varName} = await typeTextarea(page, ${JSON.stringify(value)});\n` +
+        `await assertValueContains(${varName}, ${JSON.stringify(value)});`
+      );
+    }
+    return (
+      `const ${varName} = await typeByLabel(page, '${fieldName}', ${JSON.stringify(value)});\n` +
+      `await assertValueContains(${varName}, ${JSON.stringify(value)});`
+    );
+  }
+  
+  // 新增：处理"在XXX对应的YYY输入框中，输 入：ZZZ"格式（包含空格）
+  const inputInCorrespondingFieldWithSpace = s.match(/在["']?([^"']+?)["']?对应的([^"']+?)输入框中，输\s*入：([^"']+?)[。.]?$/);
+  if (inputInCorrespondingFieldWithSpace) {
+    const optionName = cleanName(inputInCorrespondingFieldWithSpace[1]);
+    const fieldName = cleanName(inputInCorrespondingFieldWithSpace[2]);
+    const value = inputInCorrespondingFieldWithSpace[3];
+    ruleSummary.steps.push({ text: s, rule: 'fill-input-in-corresponding-field-with-space', hit: true });
+    const varName = `${fieldName.replace(/[\s"'，,。:：]/g, '')}Input`;
+    if (/金额/.test(fieldName)) {
+      return (
+        `const ${varName} = await typeAmount(page, ${JSON.stringify(value)});\n` +
+        `await assertValueContains(${varName}, ${JSON.stringify(value)});`
+      );
+    }
+    if (/释义/.test(fieldName)) {
+      return (
+        `const ${varName} = await typeTextarea(page, ${JSON.stringify(value)});\n` +
+        `await assertValueContains(${varName}, ${JSON.stringify(value)});`
+      );
+    }
+    return (
+      `const ${varName} = await typeByLabel(page, '${fieldName}', ${JSON.stringify(value)});\n` +
+      `await assertValueContains(${varName}, ${JSON.stringify(value)});`
+    );
+  }
+  
+  // 新增：处理"在XXX中输入YYY"格式
+  const inputInField = s.match(/在["']?([^"']+?)["']?中输入["']?([^"']+?)["']?/);
+  if (inputInField) {
+    const fieldName = cleanName(inputInField[1]);
+    const value = inputInField[2];
+    ruleSummary.steps.push({ text: s, rule: 'fill-input-in-field', hit: true });
+    const varName = `${fieldName.replace(/[\s"'，,。:：]/g, '')}Input`;
+    if (/金额/.test(fieldName)) {
+      return (
+        `const ${varName} = await typeAmount(page, ${JSON.stringify(value)});\n` +
+        `await assertValueContains(${varName}, ${JSON.stringify(value)});`
+      );
+    }
+    if (/释义/.test(fieldName)) {
+      return (
+        `const ${varName} = await typeTextarea(page, ${JSON.stringify(value)});\n` +
+        `await assertValueContains(${varName}, ${JSON.stringify(value)});`
+      );
+    }
+    return (
+      `const ${varName} = await typeByLabel(page, '${fieldName}', ${JSON.stringify(value)});\n` +
+      `await assertValueContains(${varName}, ${JSON.stringify(value)});`
+    );
+  }
+  
+  // 新增：处理"，押金名称输入框中输入：YYY"格式（以逗号开头）
+  const inputInFieldWithComma = s.match(/^[，,、]\s*([^"']+?)输入框中输入：([^"']+?)[。.]?$/);
+  if (inputInFieldWithComma) {
+    const fieldName = cleanName(inputInFieldWithComma[1]);
+    const value = inputInFieldWithComma[2];
+    ruleSummary.steps.push({ text: s, rule: 'fill-input-in-field-with-comma', hit: true });
+    const varName = `${fieldName.replace(/[\s"'，,。:：]/g, '')}Input`;
+    if (/金额/.test(fieldName)) {
+      return (
+        `const ${varName} = await typeAmount(page, ${JSON.stringify(value)});\n` +
+        `await assertValueContains(${varName}, ${JSON.stringify(value)});`
+      );
+    }
+    if (/释义/.test(fieldName)) {
+      return (
+        `const ${varName} = await typeTextarea(page, ${JSON.stringify(value)});\n` +
+        `await assertValueContains(${varName}, ${JSON.stringify(value)});`
+      );
+    }
+    return (
+      `const ${varName} = await typeByLabel(page, '${fieldName}', ${JSON.stringify(value)});\n` +
+      `await assertValueContains(${varName}, ${JSON.stringify(value)});`
+    );
+  }
+
+  // 新增：处理"押金名称输入框中输入：YYY"格式（缺少"在"前缀）
+  const inputInFieldNoPrefix = s.match(/^([^"',，、]+?)输入框中输入：([^"']+?)[。.]?$/);
+  if (inputInFieldNoPrefix) {
+    const fieldName = cleanName(inputInFieldNoPrefix[1]);
+    const value = inputInFieldNoPrefix[2];
+    ruleSummary.steps.push({ text: s, rule: 'fill-input-in-field-no-prefix', hit: true });
+    const varName = `${fieldName.replace(/[^a-zA-Z0-9]/g, '')}Input`;
+    if (/金额/.test(fieldName)) {
+      return (
+        `const ${varName} = await typeAmount(page, ${JSON.stringify(value)});\n` +
+        `await assertValueContains(${varName}, ${JSON.stringify(value)});`
+      );
+    }
+    if (/释义/.test(fieldName)) {
+      return (
+        `const ${varName} = await typeTextarea(page, ${JSON.stringify(value)});\n` +
+        `await assertValueContains(${varName}, ${JSON.stringify(value)});`
+      );
+    }
+    return (
+      `const ${varName} = await typeByLabel(page, '${fieldName}', ${JSON.stringify(value)});\n` +
+      `await assertValueContains(${varName}, ${JSON.stringify(value)});`
+    );
+  }
+  
+  // 新增：处理"在XXX输入框中，输入：YYY"格式（长文本）
+  const inputInFieldWithColonLong = s.match(/在["']?([^"']+?)["']?输入框中，输入：([^"']+?)[。.]?$/);
+  if (inputInFieldWithColonLong) {
+    const fieldName = cleanName(inputInFieldWithColonLong[1]);
+    const value = inputInFieldWithColonLong[2];
+    ruleSummary.steps.push({ text: s, rule: 'fill-input-in-field-with-colon-long', hit: true });
+    const varName = `${fieldName.replace(/[^a-zA-Z0-9]/g, '')}Input`;
+    if (/金额/.test(fieldName)) {
+      return (
+        `const ${varName} = await typeAmount(page, ${JSON.stringify(value)});\n` +
+        `await assertValueContains(${varName}, ${JSON.stringify(value)});`
+      );
+    }
+    if (/释义/.test(fieldName)) {
+      return (
+        `const ${varName} = await typeTextarea(page, ${JSON.stringify(value)});\n` +
+        `await assertValueContains(${varName}, ${JSON.stringify(value)});`
+      );
+    }
+    return (
+      `const ${varName} = await typeByLabel(page, '${fieldName}', ${JSON.stringify(value)});\n` +
+      `await assertValueContains(${varName}, ${JSON.stringify(value)});`
+    );
+  }
+  
+  // 新增：处理"在XXX对应的YYY输入框中输入ZZZ"格式
+  const inputInCorrespondingField = s.match(/在["']?([^"']+?)["']?对应的["']?([^"']+?)["']?输入框中输入["']?([^"']+?)["']?/);
+  if (inputInCorrespondingField) {
+    const optionName = cleanName(inputInCorrespondingField[1]);
+    const fieldName = cleanName(inputInCorrespondingField[2]);
+    const value = inputInCorrespondingField[3];
+    ruleSummary.steps.push({ text: s, rule: 'fill-input-in-corresponding-field', hit: true });
+    const varName = `${fieldName.replace(/[^a-zA-Z0-9]/g, '')}Input`;
+    if (/金额/.test(fieldName)) {
+      return (
+        `const ${varName} = await typeAmount(page, ${JSON.stringify(value)});\n` +
+        `await assertValueContains(${varName}, ${JSON.stringify(value)});`
+      );
+    }
+    if (/释义/.test(fieldName)) {
+      return (
+        `const ${varName} = await typeTextarea(page, ${JSON.stringify(value)});\n` +
+        `await assertValueContains(${varName}, ${JSON.stringify(value)});`
+      );
+    }
+    return (
+      `const ${varName} = await typeByLabel(page, '${fieldName}', ${JSON.stringify(value)});\n` +
+      `await assertValueContains(${varName}, ${JSON.stringify(value)});`
+    );
+  }
+  
   // 打开/展开"新增/新建/创建"之类的弹窗/面板（通用）
   if (/(打开|展开|新建|新增|创建).*["'](.+?)["']?/.test(s)) {
     const m = s.match(/["'](.+?)["']/)
     const btn = m ? m[1] : null
-    if (btn) { ruleSummary.steps.push({ text: s, rule: 'open-by-button', hit: true }); return `await page.getByRole('button', { name: '${btn}' }).first().click();` }
+    if (btn) { const nm = cleanName(btn); ruleSummary.steps.push({ text: s, rule: 'open-by-button', hit: true }); return `await page.getByRole('button', { name: ${JSON.stringify(nm)} }).first().click();` }
   }
 
   // 下拉选择：在XXX下拉中选择"YYY"/选择下拉"YYY"/选择"YYY"选项
@@ -382,24 +654,12 @@ function mapStepToCode(step, ruleSummary) {
   if (/(文本域|多行|textarea).*(输入|填写)/.test(s)) {
     const value = (s.match(/输入["'](.+?)["']/) || [])[1] || '示例多行文本';
     ruleSummary.steps.push({ text: s, rule: 'fill-textarea', hit: true });
-    return (
-      `{\n` +
-      `  const area = page.locator('.ant-modal-content textarea').first();\n` +
-      `  await area.fill('');\n` +
-      `  await area.type('${value}', { delay: 10 });\n` +
-      `}`
-    );
+    return `await typeTextarea(page, '${value}');`;
   }
   // 超长输入（1001个字符）
   if (/1001个字符|1000个字符以上/.test(s)) {
     ruleSummary.steps.push({ text: s, rule: 'fill-1001-chars', hit: true });
-    return (
-      `{\n` +
-      `  const longText = 'A'.repeat(1001);\n` +
-      `  const descArea = page.locator('.ant-modal-content textarea').first();\n` +
-      `  await descArea.fill(longText);\n` +
-      `}`
-    );
+    return `await typeTextarea(page, 'A'.repeat(1001));`;
   }
 
   // 指定长度/字符集输入：在XXX中输入31个字符/特殊字符/中英文
@@ -415,12 +675,10 @@ function mapStepToCode(step, ruleSummary) {
       value = '中文ABCabc123';
     }
     ruleSummary.steps.push({ text: s, rule: 'fill-by-pattern', hit: true });
+    const varName = `${labelText.replace(/[\s"'，,。:：]/g, '')}Input`;
     return (
-      `{\n` +
-      `  const targetInput = page.locator('.ant-modal-content .ant-form-item:has(label:has-text("${labelText}"))').locator('input:not([type="hidden"]), textarea').first();\n` +
-      `  await targetInput.fill('');\n` +
-      `  await targetInput.type(${JSON.stringify(value)}, { delay: 10 });\n` +
-      `}`
+      `const ${varName} = await typeByLabel(page, '${labelText}', ${JSON.stringify(value)});\n` +
+      `await assertValueContains(${varName}, ${JSON.stringify(value)});`
     );
   }
 
@@ -428,11 +686,10 @@ function mapStepToCode(step, ruleSummary) {
   if (/清空.+?(字段|输入框)/.test(s)) {
     const labelText = (s.match(/清空(.+?)(字段|输入框)/) || [])[1] || '';
     ruleSummary.steps.push({ text: s, rule: 'clear-field', hit: true });
+    const varName = `${labelText.replace(/[\s"'，,。:：]/g, '')}Input`;
     return (
-      `{\n` +
-      `  const targetInput = page.locator('.ant-modal-content .ant-form-item:has(label:has-text("${labelText}"))').locator('input:not([type="hidden"]), textarea').first();\n` +
-      `  await targetInput.fill('');\n` +
-      `}`
+      `const ${varName} = await typeByLabel(page, '${labelText}', '');\n` +
+      `await assertValueContains(${varName}, '');`
     );
   }
 
@@ -446,7 +703,7 @@ function mapExpectToCode(exp, ruleSummary) {
   const e = exp.trim();
   if (/弹窗.*弹出|正常弹出/.test(e)) {
     ruleSummary.expects.push({ text: e, rule: 'modal-visible', hit: true });
-    return (`await expect(page.locator('.ant-modal-content')).toBeVisible();`);
+    return ``; // 弹窗可见性已由步骤保证，这里不再重复
   }
   // "弹窗标题正确显示/为xxx"
   if (/弹窗标题(正确)?显示/.test(e) && !(/["""]/.test(e))) {
@@ -513,6 +770,84 @@ function mapExpectToCode(exp, ruleSummary) {
   if (/选中.*明显.*反馈/.test(e)) {
     ruleSummary.expects.push({ text: e, rule: 'selected-feedback-visible', hit: true });
     return (`await expect(page.locator('.ant-modal-content .ant-radio-wrapper-checked')).toBeVisible();`);
+  }
+  // 值应显示在指定输入框中： 输入的"X"成功显示在"Y"输入框中
+  const valInField1 = e.match(/输入的["'](.+?)["'].*?显示在["'](.+?)["']输入框/);
+  if (valInField1) {
+    const value = valInField1[1];
+    const field = valInField1[2];
+    ruleSummary.expects.push({ text: e, rule: 'value-in-input', hit: true });
+    return `await assertValueContains(page, '${field}', ${JSON.stringify(value)});`;
+  }
+  // 另一种表达： 输入的金额"X"成功显示在金额输入框中
+  const valInField2 = e.match(/输入的.*?["'](.+?)["'].*?显示在(.+?)输入框/);
+  if (valInField2) {
+    const value = valInField2[1];
+    const field = valInField2[2].replace(/(的)?/g, '').trim() || '';
+    if (field) {
+      ruleSummary.expects.push({ text: e, rule: 'value-in-input', hit: true });
+      return `await assertValueContains(page, '${field}', ${JSON.stringify(value)});`;
+    }
+  }
+  // 弹窗关闭并回到列表
+  if (/弹窗关闭/.test(e) && /(列表|页面).*(看到|出现)/.test(e)) {
+    ruleSummary.expects.push({ text: e, rule: 'modal-closed-and-list', hit: true });
+    return `await assertModalClosedAndTable(page);`;
+  }
+  
+  // 新增：处理"弹出XXX弹窗"格式
+  if (/弹出["']?([^"']+?)["']?弹窗/.test(e)) {
+    const modalTitle = e.match(/弹出["']?([^"']+?)["']?弹窗/)[1];
+    ruleSummary.expects.push({ text: e, rule: 'modal-appears', hit: true });
+    return ``; // 避免与点击确定后的关闭断言冲突
+  }
+  
+  // 新增：处理"弹出XXX的弹窗"格式
+  if (/弹出["']?([^"']+?)["']?的弹窗/.test(e)) {
+    const modalTitle = e.match(/弹出["']?([^"']+?)["']?的弹窗/)[1];
+    ruleSummary.expects.push({ text: e, rule: 'modal-appears-with-possessive', hit: true });
+    return ``; // 统一走收尾断言
+  }
+  
+  // 新增：处理"输入的XXX成功显示在YYY输入框中"格式
+  const valueInField3 = e.match(/输入的["']?([^"']+?)["']?成功显示在["']?([^"']+?)["']?输入框中/);
+  if (valueInField3) {
+    const value = valueInField3[1];
+    const field = valueInField3[2];
+    ruleSummary.expects.push({ text: e, rule: 'value-displayed-in-field', hit: true });
+    return `await assertValueContains(page, '${field}', ${JSON.stringify(value)});`;
+  }
+  
+  // 新增：处理"XXX选项被选中"格式
+  const optionSelected = e.match(/["']?([^"']+?)["']?选项被选中/);
+  if (optionSelected) {
+    const optionName = optionSelected[1];
+    ruleSummary.expects.push({ text: e, rule: 'option-selected', hit: true });
+    return `await expect(page.locator('.ant-modal-content input[type="radio"]:checked + label:has-text("${optionName}"), .ant-modal-content .ant-radio-wrapper-checked:has-text("${optionName}")')).toBeVisible();`;
+  }
+  
+  // 新增：处理"输入的XXX成功显示在YYY输入框中"（释义场景同用 value-displayed-in-field 规则）
+  const descInField = e.match(/输入的["']?(.+?)["']?成功显示在["']?([^"']+?)["']?输入框中/);
+  if (descInField) {
+    const value = descInField[1];
+    const field = descInField[2];
+    ruleSummary.expects.push({ text: e, rule: 'value-displayed-in-field', hit: true });
+    return `await assertValueContains(page, '${field}', ${JSON.stringify(value)});`;
+  }
+  
+  // 新增：处理"弹窗关闭，页面刷新，并在XXX页面的列表中看到一条新的XXX记录"格式
+  const modalCloseAndNewRecord = e.match(/弹窗关闭.*页面刷新.*在["']?([^"']+?)["']?页面的列表中看到一条新的["']?([^"']+?)["']?记录/);
+  if (modalCloseAndNewRecord) {
+    const pageName = modalCloseAndNewRecord[1];
+    const recordType = modalCloseAndNewRecord[2];
+    ruleSummary.expects.push({ text: e, rule: 'modal-close-and-new-record', hit: true });
+    return (
+      `{\n` +
+      `  await expect(page.locator('.ant-modal-content')).toHaveCount(0);\n` +
+      `  await expect(page.locator('table, .ant-table')).toBeVisible();\n` +
+      `  await expect(page.locator('table tbody tr')).toHaveCount({ min: 1 });\n` +
+      `}`
+    );
   }
   if (/应提示.*超出.*长度|字数限制/.test(e)) {
     ruleSummary.expects.push({ text: e, rule: 'length-exceeded-error', hit: true })
@@ -930,6 +1265,60 @@ app.get('/api/report/:id', async (req, res) => {
   }
 });
 
+// 直接执行（SSE）：不生成.spec.ts，按用例直接执行
+app.post('/api/direct-exec-stream', async (req, res) => {
+  try {
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    if (typeof res.flushHeaders === 'function') res.flushHeaders();
+
+    const send = (event, data) => {
+      try {
+        res.write(`event: ${event}\n`);
+        res.write(`data: ${JSON.stringify(data)}\n\n`);
+      } catch {}
+    };
+
+    const { tapdSelected = [], tapdPageInfo = {}, options = {} } = req.body || {};
+    send('start', { total: (tapdSelected || []).length });
+    // 若未显式传入 storageState，则尝试使用全局登录态 .auth/user.json（若存在）
+    let storageStatePath = options.storageState;
+    try {
+      if (!storageStatePath) {
+        const candidate = path.join(__dirname, '../.auth/user.json');
+        await fs.stat(candidate);
+        storageStatePath = candidate;
+      }
+    } catch (_) {}
+
+    const exec = await directExecutor.executeCases({
+      cases: tapdSelected,
+      pageUrl: tapdPageInfo?.pageUrl,
+      browser: options.browser || 'chromium',
+      headless: options.headless !== false,
+      timeout: options.timeout || 30000,
+      retries: options.retries ?? 0,
+      storageState: storageStatePath,
+      onEvent: (type, payload) => {
+        if (type === 'frame') send('frame', payload);
+        else if (type === 'video') send('video', payload);
+        else if (type === 'log') send('log', payload);
+      }
+    });
+
+    for (const sum of exec.results) send('case', sum);
+    send('end', { success: true });
+    res.end();
+  } catch (e) {
+    try {
+      res.write(`event: error\n`);
+      res.write(`data: ${JSON.stringify({ message: e.message })}\n\n`);
+    } catch {}
+    res.end();
+  }
+});
+
 // TAPD 测试用例相关接口
 app.get('/api/tapd/testcases', async (req, res) => {
   try {
@@ -1128,7 +1517,7 @@ app.post('/api/generate-test', async (req, res) => {
 
     // 将 Markdown 用例拆分为多个测试
     const parsedCases = parseMarkdownTestCases(bodyMd);
-    const header = `import { test, expect } from '@playwright/test';\n\n`;
+    const header = `import { test, expect } from '@playwright/test';\nimport { typeByLabel, clickOptionByText, typeAmount, typeTextarea, clickOk, assertModalClosedAndTable, assertValueContains } from '../helpers/helpers';\n\n`;
     const suiteStart = `test.describe('${pageName} - 自动生成用例', () => {\n`;
     const suiteEnd = `});\n`;
     const ruleSummary = { steps: [], expects: [] };
@@ -1260,7 +1649,7 @@ app.post('/api/generate-test-stream', async (req, res) => {
     console.log('🔍 解析到的用例:', JSON.stringify(parsedCases, null, 2));
     send('progress', { message: `解析用例文本并结构化步骤（${parsedCases.length} 个用例）` });
 
-    const header = `import { test, expect } from '@playwright/test';\n\n`;
+    const header = `import { test, expect } from '@playwright/test';\nimport { typeByLabel, clickOptionByText, typeAmount, typeTextarea, clickOk, assertModalClosedAndTable, assertValueContains } from '../helpers/helpers';\n\n`;
     const suiteStart = `test.describe('${pageName} - 自动生成用例', () => {\n`;
     const suiteEnd = `});\n`;
     const ruleSummary = { steps: [], expects: [] };
@@ -1286,11 +1675,25 @@ app.post('/api/generate-test-stream', async (req, res) => {
       console.log('🔍 开始兜底规则匹配，原始文本:', bodyMd);
       const rawLines = bodyMd.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
       console.log('📝 解析到的行数:', rawLines.length);
+      let inExpectsMode = false;
       for (const line of rawLines) {
         const text = line.replace(/^[-•\d\.)]\s*/, '');
         if (!text) continue;
         console.log('🔍 处理行:', text);
-        if (/应|显示|选中|成功|失败|提示|可见|包含|等于|相等|标题|预期|结果/.test(text)) {
+        
+        // 检查是否是预期结果标识
+        if (/^\*\*预期结果\*\*[:：]?$/i.test(line) || /^预期结果[:：]?$/i.test(text)) {
+          inExpectsMode = true;
+          console.log('✅ 进入预期结果模式');
+          continue;
+        }
+        if (/^\*\*步(骤|驟)\*\*[:：]?$/i.test(line) || /^步(骤|驟)[:：]?$/i.test(text)) {
+          inExpectsMode = false;
+          console.log('✅ 进入步骤模式');
+          continue;
+        }
+        
+        if (inExpectsMode || /应|显示|选中|成功|失败|提示|可见|包含|等于|相等|标题|预期|结果/.test(text)) {
           console.log('✅ 识别为预期:', text);
           mapExpectToCode(text, ruleSummary);
         } else {
@@ -1299,6 +1702,36 @@ app.post('/api/generate-test-stream', async (req, res) => {
         }
       }
       console.log('📊 兜底后的规则摘要:', ruleSummary);
+    }
+    
+    // 修复：如果预期结果被错误地放入了steps中，需要重新分类
+    if (ruleSummary.expects.length === 0 && ruleSummary.steps.length > 0) {
+      console.log('🔍 检测到预期结果可能被错误分类，开始重新分类...');
+      const stepsToMove = [];
+      const remainingSteps = [];
+      
+      for (const step of ruleSummary.steps) {
+        const text = step.text;
+        if (/应|显示|选中|成功|失败|提示|可见|包含|等于|相等|标题|预期|结果|弹出.*弹窗|输入.*成功显示|选项被选中|弹窗关闭/.test(text)) {
+          console.log('🔄 重新分类为预期:', text);
+          stepsToMove.push(step);
+        } else {
+          remainingSteps.push(step);
+        }
+      }
+      
+      if (stepsToMove.length > 0) {
+        console.log(`🔄 重新分类了 ${stepsToMove.length} 个预期结果`);
+        ruleSummary.steps = remainingSteps;
+        ruleSummary.expects = stepsToMove.map(step => {
+          const expectCode = mapExpectToCode(step.text, { steps: [], expects: [] });
+          return {
+            text: step.text,
+            rule: expectCode ? 'reclassified-expect' : 'unmatched',
+            hit: !!expectCode
+          };
+        });
+      }
     }
     // 仍为空则填充占位项，确保前端能渲染
     if (ruleSummary.steps.length === 0 && ruleSummary.expects.length === 0) {

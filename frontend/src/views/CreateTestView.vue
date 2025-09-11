@@ -319,6 +319,14 @@
           >
             一键生成自动化代码
           </button>
+          <button 
+            @click="executeDirect" 
+            class="generate-btn"
+            :disabled="!canGenerate || directRunning"
+            style="margin-left:8px;background:#059669;"
+          >
+            直接执行（不生成代码）
+          </button>
         </div>
       </div>
 
@@ -341,6 +349,7 @@
         <div class="ai-tabs">
           <button :class="['tab', aiTab==='steps' && 'active']" @click="aiTab='steps'">步骤推演</button>
           <button :class="['tab', aiTab==='rules' && 'active']" @click="aiTab='rules'">命中规则</button>
+          <button :class="['tab', aiTab==='preview' && 'active']" @click="aiTab='preview'">执行预览</button>
         </div>
         <div class="ai-body">
           <template v-if="aiTab==='steps'">
@@ -350,7 +359,7 @@
             <div v-if="stepsList.length===0" class="empty">生成后这里展示分步骤的关键动作与断言。</div>
           </template>
           <template v-else>
-            <div>
+            <div v-if="aiTab==='rules'">
               <!-- 调试信息 -->
               <div style="background: #f0f0f0; padding: 8px; margin-bottom: 12px; font-size: 12px; color: #666;">
                 <strong>调试信息:</strong><br>
@@ -435,6 +444,25 @@
                 </button>
               </div>
             </div>
+            <div v-else-if="aiTab==='preview'" class="live-preview">
+              <div class="preview-header">
+                <span>实时预览</span>
+                <small v-if="latestVideo">执行完成后可下载视频</small>
+              </div>
+              <div class="preview-body">
+                <img v-if="latestFrame" :src="latestFrame" class="preview-img" />
+                <div v-else class="empty">等待执行帧...</div>
+              </div>
+              <div class="preview-footer">
+                <a v-if="latestVideo" :href="latestVideo" target="_blank" class="btn sm">查看录屏</a>
+              </div>
+              <div class="logs">
+                <div v-for="(l, i) in liveLogs" :key="i" class="log-row">
+                  <span class="lvl" :class="l.level">{{ l.level }}</span>
+                  <span class="msg">{{ l.text }}</span>
+                </div>
+              </div>
+            </div>
           </template>
         </div>
         <div class="ai-footer">
@@ -501,6 +529,11 @@ const manualInput = ref<ManualInput>({
 })
 const generatedCode = ref('')
 const isAnalyzing = ref(false)
+const directRunning = ref(false)
+const aiTab = ref<'steps'|'rules'|'preview'>('steps')
+const latestFrame = ref<string>('')
+const latestVideo = ref<string>('')
+const liveLogs = ref<Array<{level:string;text:string}>>([])
 
 // Bug提交相关
 const bugDialog = ref<{ visible: boolean }>({ visible: false })
@@ -512,7 +545,7 @@ const bugForm = ref<{ title: string; severity: number; priority: number; owner?:
   owner: '',
   description: ''
 })
-const aiTab = ref<'steps'|'rules'>('steps')
+// aiTab 定义已上移并扩展为含 preview
 const stepsList = ref<string[]>([])
 // 存储从进度事件中提取的“用例标题”（例如："1. 基础押金创建流程"）
 const caseTitles = ref<string[]>([])
@@ -1005,6 +1038,84 @@ async function generateTestCode() {
     console.error('生成测试代码失败:', error)
     alert('生成失败，请重试')
   } finally {
+    isAnalyzing.value = false
+  }
+}
+
+// 直接执行：不生成代码，按所选 TAPD 用例直接驱动浏览器
+async function executeDirect() {
+  try {
+    directRunning.value = true
+    isAnalyzing.value = true
+    aiTab.value = 'steps'
+    stepsList.value = []
+
+    const selectedList = selectedTapdTestCases.value.length > 0 
+      ? selectedTapdTestCases.value 
+      : (selectedTapdTestCase.value ? [selectedTapdTestCase.value] : [])
+    if (selectedList.length === 0) {
+      alert('请先选择至少一条 TAPD 用例')
+      return
+    }
+
+    const slimSelected = selectedList.map(tc => ({
+      id: tc.id,
+      title: tc.title,
+      module: tc.module,
+      expectedResult: tc.expectedResult,
+      steps: (tc.steps || []).map(s => ({ step: s.step, action: s.action, expected: s.expected }))
+    }))
+
+    const resp = await fetch('http://localhost:3002/api/direct-exec-stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        tapdSelected: slimSelected,
+        tapdPageInfo: tapdPageInfo.value,
+        options: { browser: 'chromium', headless: true, retries: 0 }
+      })
+    })
+    if (!resp.ok || !resp.body) throw new Error('执行接口不可用')
+
+    const reader = resp.body.getReader()
+    const decoder = new TextDecoder('utf-8')
+    let buffer = ''
+    while (true) {
+      const { value, done } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      const parts = buffer.split('\n\n')
+      buffer = parts.pop() || ''
+      for (const chunk of parts) {
+        const ev = /event:\s*(.*)/.exec(chunk)?.[1]?.trim() || 'message'
+        const dataLine = /data:\s*(.*)/s.exec(chunk)?.[1] || '{}'
+        let data: any = {}
+        try { data = JSON.parse(dataLine) } catch {}
+        if (ev === 'start') {
+          stepsList.value = [...stepsList.value, `开始直接执行：共 ${data.total || 0} 条用例`]
+          aiTab.value = 'preview'
+        } else if (ev === 'case') {
+          const title = data.title || data.id || '未命名用例'
+          const ok = data.success ? '✅ 成功' : '❌ 失败'
+          stepsList.value = [...stepsList.value, `${ok} - ${title}`]
+        } else if (ev === 'frame') {
+          if (data && data.url) latestFrame.value = `http://localhost:3002${data.url}`
+        } else if (ev === 'video') {
+          if (data && data.url) latestVideo.value = `http://localhost:3002${data.url}`
+        } else if (ev === 'log') {
+          if (data && data.text) liveLogs.value = [...liveLogs.value, { level: data.level || 'log', text: data.text }]
+        } else if (ev === 'end') {
+          stepsList.value = [...stepsList.value, '执行完成']
+        } else if (ev === 'error') {
+          stepsList.value = [...stepsList.value, `错误：${data.message}`]
+        }
+      }
+    }
+  } catch (e: any) {
+    console.error('直接执行失败:', e)
+    alert(`直接执行失败：${e.message || e}`)
+  } finally {
+    directRunning.value = false
     isAnalyzing.value = false
   }
 }
@@ -1574,6 +1685,19 @@ onUnmounted(() => {
 .fallback-rules { 
   margin-top: 8px; 
 }
+
+/* 预览面板 */
+.live-preview { display: grid; gap: 8px; }
+.preview-header { display: flex; justify-content: space-between; align-items: center; color: #374151; }
+.preview-body { border: 1px solid #eef2f7; border-radius: 8px; background: #f8fafc; display: flex; align-items: center; justify-content: center; min-height: 220px; }
+.preview-img { max-width: 100%; border-radius: 6px; box-shadow: 0 2px 6px rgba(0,0,0,0.06); }
+.preview-footer { display: flex; justify-content: flex-end; }
+.logs { margin-top: 8px; max-height: 140px; overflow: auto; border: 1px dashed #e5e7eb; border-radius: 6px; padding: 8px; background: #fff; }
+.log-row { font-size: 12px; color: #374151; display: flex; gap: 8px; padding: 2px 0; }
+.lvl { text-transform: uppercase; font-weight: 600; }
+.lvl.error { color: #dc2626; }
+.lvl.warning { color: #d97706; }
+.lvl.log { color: #2563eb; }
 
 /* Bug提交样式 */
 .bug-report-section {
