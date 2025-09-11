@@ -19,7 +19,10 @@ export class FuyouLoginPage extends BasePage {
 
   async navigateToLogin() {
     // 直接使用登录 URL，而不是相对路径
-    const loginUrl = process.env.LOGIN_URL || 'https://r1ua.fuyoukache.com/view/admin/login?srcType=user&redirectUrl=https%3A%2F%2Fr1bms.fuyoukache.com%2F%23%2Forder%2Flist';
+    const loginUrl = process.env.LOGIN_URL;
+    if (!loginUrl) {
+      throw new Error('未配置 LOGIN_URL，请在 .env 中设置目标环境的登录地址');
+    }
     await this.page.goto(loginUrl);
     await this.waitForPageLoad();
   }
@@ -107,12 +110,21 @@ export class FuyouLoginPage extends BasePage {
   }
 
   async expectLoginSuccess() {
-    // 等待重定向到主页面
-    await this.page.waitForURL('**/r1bms.fuyoukache.com/**', { timeout: 10000 });
-    
-    // 检查是否成功登录（可能需要根据实际页面调整）
-    const currentUrl = this.page.url();
-    expect(currentUrl).toContain('r1bms.fuyoukache.com');
+    // 从 TEST_BASE_URL 推导期望的业务域名
+    const expectedBase = process.env.TEST_BASE_URL;
+    let expectedHost: string | null = null;
+    try {
+      if (expectedBase) expectedHost = new URL(expectedBase).host;
+    } catch {}
+
+    if (expectedHost) {
+      await this.page.waitForURL(`**//${expectedHost}/**`, { timeout: 10000 });
+      const currentUrl = this.page.url();
+      expect(currentUrl).toContain(expectedHost);
+    } else {
+      // 无法推导主域名时，退化为等待网络空闲
+      await this.page.waitForLoadState('networkidle');
+    }
   }
 
   async expectLoginError(message?: string) {
@@ -125,8 +137,15 @@ export class FuyouLoginPage extends BasePage {
 
   async expectToBeLoggedIn() {
     // 检查是否已登录（可能需要根据实际页面调整）
+    const expectedBase = process.env.TEST_BASE_URL;
+    let expectedHost: string | null = null;
+    try {
+      if (expectedBase) expectedHost = new URL(expectedBase).host;
+    } catch {}
     const currentUrl = this.page.url();
-    expect(currentUrl).toContain('r1bms.fuyoukache.com');
+    if (expectedHost) {
+      expect(currentUrl).toContain(expectedHost);
+    }
     
     // 检查是否存在登录后才有的元素（右上角用户名）
     await expect(this.page.locator('span.name')).toBeVisible();

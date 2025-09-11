@@ -7,7 +7,7 @@ export class BasePage {
   constructor(page: Page, baseURL?: string) {
     this.page = page;
     // 优先使用传入的 baseURL，其次使用环境变量，最后使用默认值
-    this.baseURL = baseURL || process.env.TEST_BASE_URL || 'https://r1bms.fuyoukache.com/';
+    this.baseURL = baseURL || process.env.TEST_BASE_URL || '';
   }
 
   async goto(path: string = '/') {
