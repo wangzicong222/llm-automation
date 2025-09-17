@@ -353,14 +353,19 @@ function mapStepToCode(step, ruleSummary) {
     ruleSummary.steps.push({ text: s, rule: 'fill-input-by-label', hit: true });
     const varName = `${labelText.replace(/[\s"'，,。:：]/g, '')}Input`;
     if (/释义/.test(labelText)) {
-      return (
+    return (
         `const ${varName} = await typeTextarea(page, ${JSON.stringify(value || '示例文本')});\n` +
         `await assertValueContains(${varName}, ${JSON.stringify(value || '示例文本')});`
       );
     }
     return (
       `const ${varName} = await typeByLabel(page, '${labelText}', ${JSON.stringify(value || '示例文本')});\n` +
-      `await assertValueContains(${varName}, ${JSON.stringify(value || '示例文本')});`
+      `await assertValueContains(${varName}, ${JSON.stringify(value || '示例文本')});\n` +
+      `if (!((await ${varName}.inputValue()).includes(${JSON.stringify(value || '示例文本')}))) {\n` +
+      `  await ${varName}.click({ force: true });\n` +
+      `  await ${varName}.type(${JSON.stringify(value || '示例文本')}, { delay: 10 });\n` +
+      `  await assertValueContains(${varName}, ${JSON.stringify(value || '示例文本')});\n` +
+      `}`
     );
   }
   
@@ -379,7 +384,12 @@ function mapStepToCode(step, ruleSummary) {
     }
     return (
       `const ${varName} = await typeByLabel(page, '${fieldName}', ${JSON.stringify(value)});\n` +
-      `await assertValueContains(${varName}, ${JSON.stringify(value)});`
+      `await assertValueContains(${varName}, ${JSON.stringify(value)});\n` +
+      `if (!((await ${varName}.inputValue()).includes(${JSON.stringify(value)}))) {\n` +
+      `  await ${varName}.click({ force: true });\n` +
+      `  await ${varName}.type(${JSON.stringify(value)}, { delay: 10 });\n` +
+      `  await assertValueContains(${varName}, ${JSON.stringify(value)});\n` +
+      `}`
     );
   }
   
@@ -405,7 +415,12 @@ function mapStepToCode(step, ruleSummary) {
     }
     return (
       `const ${varName} = await typeByLabel(page, '${fieldName}', ${JSON.stringify(value)});\n` +
-      `await assertValueContains(${varName}, ${JSON.stringify(value)});`
+      `await assertValueContains(${varName}, ${JSON.stringify(value)});\n` +
+      `if (!((await ${varName}.inputValue()).includes(${JSON.stringify(value)}))) {\n` +
+      `  await ${varName}.click({ force: true });\n` +
+      `  await ${varName}.type(${JSON.stringify(value)}, { delay: 10 });\n` +
+      `  await assertValueContains(${varName}, ${JSON.stringify(value)});\n` +
+      `}`
     );
   }
   
@@ -440,7 +455,12 @@ function mapStepToCode(step, ruleSummary) {
     }
     return (
       `const ${varName} = await typeByLabel(page, '${fieldName}', ${JSON.stringify(value)});\n` +
-      `await assertValueContains(${varName}, ${JSON.stringify(value)});`
+      `await assertValueContains(${varName}, ${JSON.stringify(value)});\n` +
+      `if (!((await ${varName}.inputValue()).includes(${JSON.stringify(value)}))) {\n` +
+      `  await ${varName}.click({ force: true });\n` +
+      `  await ${varName}.type(${JSON.stringify(value)}, { delay: 10 });\n` +
+      `  await assertValueContains(${varName}, ${JSON.stringify(value)});\n` +
+      `}`
     );
   }
   
@@ -466,7 +486,12 @@ function mapStepToCode(step, ruleSummary) {
     }
     return (
       `const ${varName} = await typeByLabel(page, '${fieldName}', ${JSON.stringify(value)});\n` +
-      `await assertValueContains(${varName}, ${JSON.stringify(value)});`
+      `await assertValueContains(${varName}, ${JSON.stringify(value)});\n` +
+      `if (!((await ${varName}.inputValue()).includes(${JSON.stringify(value)}))) {\n` +
+      `  await ${varName}.click({ force: true });\n` +
+      `  await ${varName}.type(${JSON.stringify(value)}, { delay: 10 });\n` +
+      `  await assertValueContains(${varName}, ${JSON.stringify(value)});\n` +
+      `}`
     );
   }
   
@@ -491,7 +516,12 @@ function mapStepToCode(step, ruleSummary) {
     }
     return (
       `const ${varName} = await typeByLabel(page, '${fieldName}', ${JSON.stringify(value)});\n` +
-      `await assertValueContains(${varName}, ${JSON.stringify(value)});`
+      `await assertValueContains(${varName}, ${JSON.stringify(value)});\n` +
+      `if (!((await ${varName}.inputValue()).includes(${JSON.stringify(value)}))) {\n` +
+      `  await ${varName}.click({ force: true });\n` +
+      `  await ${varName}.type(${JSON.stringify(value)}, { delay: 10 });\n` +
+      `  await assertValueContains(${varName}, ${JSON.stringify(value)});\n` +
+      `}`
     );
   }
   
@@ -516,7 +546,12 @@ function mapStepToCode(step, ruleSummary) {
     }
     return (
       `const ${varName} = await typeByLabel(page, '${fieldName}', ${JSON.stringify(value)});\n` +
-      `await assertValueContains(${varName}, ${JSON.stringify(value)});`
+      `await assertValueContains(${varName}, ${JSON.stringify(value)});\n` +
+      `if (!((await ${varName}.inputValue()).includes(${JSON.stringify(value)}))) {\n` +
+      `  await ${varName}.click({ force: true });\n` +
+      `  await ${varName}.type(${JSON.stringify(value)}, { delay: 10 });\n` +
+      `  await assertValueContains(${varName}, ${JSON.stringify(value)});\n` +
+      `}`
     );
   }
 
@@ -541,7 +576,12 @@ function mapStepToCode(step, ruleSummary) {
     }
     return (
       `const ${varName} = await typeByLabel(page, '${fieldName}', ${JSON.stringify(value)});\n` +
-      `await assertValueContains(${varName}, ${JSON.stringify(value)});`
+      `await assertValueContains(${varName}, ${JSON.stringify(value)});\n` +
+      `if (!((await ${varName}.inputValue()).includes(${JSON.stringify(value)}))) {\n` +
+      `  await ${varName}.click({ force: true });\n` +
+      `  await ${varName}.type(${JSON.stringify(value)}, { delay: 10 });\n` +
+      `  await assertValueContains(${varName}, ${JSON.stringify(value)});\n` +
+      `}`
     );
   }
   
@@ -857,10 +897,26 @@ function mapExpectToCode(exp, ruleSummary) {
     return `// TODO: 如果有字数统计元素，请在此添加选择器断言`;
   }
   if (/未填写.*点击.*确定.*提示/.test(e)) {
-    return `// TODO: 根据校验提示元素断言为空提示，例如 .ant-form-item-explain-error`;
+    ruleSummary.expects.push({ text: e, rule: 'validation-error-on-empty', hit: true });
+    return `await expect(page.locator('.ant-form-item-explain-error')).toBeVisible();`;
+  }
+  
+  // 新增：处理"XX字段为空时点击确定应提示验证错误"格式（通用）
+  const emptyFieldValidation = e.match(/([^，,。\s]+).*空.*点击.*确定.*提示/);
+  if (emptyFieldValidation) {
+    const fieldName = emptyFieldValidation[1];
+    ruleSummary.expects.push({ text: e, rule: 'field-empty-validation', hit: true });
+    return `await expect(page.locator('.ant-form-item-explain-error')).toBeVisible();`;
+  }
+  
+  // 新增：处理"弹窗保持打开状态"格式
+  if (/弹窗.*保持.*打开|弹窗.*未关闭/.test(e)) {
+    ruleSummary.expects.push({ text: e, rule: 'modal-stays-open', hit: true });
+    return `await expect(page.locator('.ant-modal-content')).toBeVisible();`;
   }
   if (/填写完整.*点击.*确定.*保存成功|关闭弹窗/.test(e)) {
-    return `// TODO: 依据系统的成功提示断言，例如 .ant-message-success 或弹窗关闭`;
+    ruleSummary.expects.push({ text: e, rule: 'form-submit-success', hit: true });
+    return `await assertModalClosedAndTable(page);`;
   }
   if (/输入合法字符.*(正常|成功).*显示/.test(e)) {
     ruleSummary.expects.push({ text: e, rule: 'valid-input-no-error', hit: true })
@@ -1265,6 +1321,24 @@ app.get('/api/report/:id', async (req, res) => {
   }
 });
 
+// 删除单个报告文件
+app.delete('/api/report/:id', async (req, res) => {
+  try {
+    const id = req.params.id;
+    if (!id) return res.status(400).json({ success: false, message: '缺少报告ID' });
+    const file = path.join(__dirname, '../test-results/reports', `${id}.json`);
+    try {
+      await fs.unlink(file);
+    } catch (e) {
+      // 不存在也视为成功
+      if (e && e.code !== 'ENOENT') throw e;
+    }
+    res.json({ success: true, id });
+  } catch (e) {
+    res.status(500).json({ success: false, message: '删除报告失败', error: e.message });
+  }
+});
+
 // 直接执行（SSE）：不生成.spec.ts，按用例直接执行
 app.post('/api/direct-exec-stream', async (req, res) => {
   try {
@@ -1300,14 +1374,50 @@ app.post('/api/direct-exec-stream', async (req, res) => {
       timeout: options.timeout || 30000,
       retries: options.retries ?? 0,
       storageState: storageStatePath,
+      visualMode: options.visualMode || false,
+      debugMode: options.debugMode || false,
       onEvent: (type, payload) => {
         if (type === 'frame') send('frame', payload);
         else if (type === 'video') send('video', payload);
         else if (type === 'log') send('log', payload);
+        else if (type === 'debug-step') send('debug-step', payload);
       }
     });
 
     for (const sum of exec.results) send('case', sum);
+
+    // 新增：保存一次性汇总报告，包含所有直接执行的用例
+    try {
+      const reportsDir = path.join(__dirname, '../test-results/reports');
+      await fs.mkdir(reportsDir, { recursive: true });
+      const reportId = `direct-${Date.now()}`;
+      const total = exec.results.length;
+      const passed = exec.results.filter(r => r.success).length;
+      const failed = total - passed;
+      const summary = {
+        id: reportId,
+        name: tapdPageInfo?.pageName ? `${tapdPageInfo.pageName}（直接执行）` : '直接执行报告',
+        testSuite: tapdPageInfo?.pageName || '直接执行',
+        executionTime: new Date().toISOString(),
+        status: failed === 0 ? 'success' : 'failure',
+        totalTests: total,
+        passedTests: passed,
+        failedTests: failed,
+        successRate: total > 0 ? Math.round((passed / total) * 100) : 0,
+        tests: exec.results.map((r, idx) => ({
+          id: String(idx + 1),
+          name: r.title || r.caseTitle || `case-${idx + 1}`,
+          status: r.success ? 'success' : 'failure',
+          duration: r.duration || 0,
+          error: r.error || undefined
+        }))
+      };
+      await fs.writeFile(path.join(reportsDir, `${reportId}.json`), JSON.stringify(summary, null, 2));
+      send('summary', { reportId, ...summary });
+    } catch (e) {
+      send('log', { level: 'warn', message: `保存直接执行报告失败: ${e.message}` });
+    }
+
     send('end', { success: true });
     res.end();
   } catch (e) {

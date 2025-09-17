@@ -410,6 +410,17 @@ const successRate = computed(() => {
 })
 
 // 方法
+// 通用带超时的 fetch，避免请求异常导致前端一直处于执行中
+const fetchWithTimeout = async (url: string, options: any = {}, timeoutMs = 180000) => {
+  const controller = new AbortController()
+  const id = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const resp = await fetch(url, { ...options, signal: controller.signal })
+    return resp
+  } finally {
+    clearTimeout(id)
+  }
+}
 const executeTest = async () => {
   if (!canExecute.value) return
   
@@ -491,11 +502,14 @@ const runFile = async (file: string) => {
   // 调用后端以 headed 模式执行
   try {
     isExecuting.value = true
-    await fetch('http://localhost:3002/api/execute-test', {
+    const resp = await fetchWithTimeout('http://localhost:3002/api/execute-test', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ testFile: file, options: { headed: visualMode.value } })
-    })
+    }, 300000) // 最长 5 分钟
+    if (!resp.ok) throw new Error('后端执行失败')
+    // 读取一次结果，确保请求完整结束
+    await resp.json().catch(() => ({}))
     // 本地计数+1（简单统计）
     const key = file
     runCounts.value[key] = (runCounts.value[key] || 0) + 1
@@ -503,6 +517,12 @@ const runFile = async (file: string) => {
     console.error('可视化执行失败:', e)
   } finally {
     isExecuting.value = false
+    executingFile.value = null
+    // 刷新一次计数与文件元信息，避免进度条卡住
+    fetchRunCounts()
+    loadAvailableTestFiles()
+    // 双保险：下一个事件循环再次复位
+    setTimeout(() => { isExecuting.value = false; executingFile.value = null }, 0)
   }
 }
 
@@ -706,6 +726,7 @@ const formatTime = (ts: number): string => {
 onMounted(() => {
   // 初始化时加载可用的测试文件
   loadAvailableTestFiles()
+  fetchRunCounts()
   computeTableHeight()
   window.addEventListener('resize', computeTableHeight)
 })
@@ -730,6 +751,20 @@ const loadAvailableTestFiles = async () => {
     }
   } catch (error) {
     console.error('加载测试文件失败:', error)
+  }
+}
+
+// 拉取运行统计文件，保障刷新后仍能显示历史执行次数
+const fetchRunCounts = async () => {
+  try {
+    const resp = await fetch('http://localhost:3002/api/run-counts')
+    if (resp.ok) {
+      const data = await resp.json()
+      const counts = data.counts || {}
+      runCounts.value = { ...runCounts.value, ...counts }
+    }
+  } catch (e) {
+    // 忽略错误，不影响页面
   }
 }
 </script>

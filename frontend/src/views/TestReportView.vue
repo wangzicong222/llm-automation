@@ -104,6 +104,7 @@
                 <td>
                   <div class="action-buttons">
                     <button @click="viewReport(report)" class="btn-view">查看</button>
+                    <button @click="viewPlaywrightReport(report)" class="btn-playwright">详细报告</button>
                     <button @click="exportReport(report)" class="btn-export">导出</button>
                     <button @click="deleteReport(report)" class="btn-delete">删除</button>
                   </div>
@@ -436,12 +437,50 @@ function exportReport(report: TestReport) {
   alert(`正在导出报告: ${report.name}`)
 }
 
-function deleteReport(report: TestReport) {
-  if (confirm(`确定要删除报告 "${report.name}" 吗？`)) {
+async function deleteReport(report: TestReport) {
+  if (!confirm(`确定要删除报告 "${report.name}" 吗？`)) return
+  try {
+    const resp = await fetch(`http://localhost:3002/api/report/${encodeURIComponent(report.id)}`, { method: 'DELETE' })
+    if (!resp.ok) throw new Error('服务端删除失败')
     const index = reports.value.findIndex(r => r.id === report.id)
-    if (index > -1) {
-      reports.value.splice(index, 1)
+    if (index > -1) reports.value.splice(index, 1)
+  } catch (e:any) {
+    alert(`删除失败：${e.message}`)
+  }
+}
+
+async function viewPlaywrightReport(report: TestReport) {
+  try {
+    console.log('🔄 正在打开 Playwright 详细报告...')
+    
+    // 尝试启动 Playwright 报告服务
+    const response = await fetch('http://localhost:3002/api/start-playwright-report', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      }
+    })
+    
+    if (response.ok) {
+      const result = await response.json()
+      console.log('✅ Playwright 报告服务启动成功:', result)
+      
+      // 在新窗口中打开 Playwright 报告
+      setTimeout(() => {
+        window.open(result.reportUrl, '_blank')
+      }, 1000)
+      
+    } else {
+      console.warn('⚠️ 启动报告服务失败，尝试备用方案')
+      
+      // 备用方案：直接打开默认端口
+      const fallbackUrl = 'http://localhost:9323'
+      window.open(fallbackUrl, '_blank')
+      alert('正在尝试打开 Playwright 详细报告，如果页面无法加载，请确保已执行过测试')
     }
+  } catch (error: any) {
+    console.error('❌ 打开 Playwright 报告失败:', error)
+    alert('无法打开详细报告，请确保 Playwright 报告服务正在运行')
   }
 }
 
@@ -709,6 +748,7 @@ onMounted(async () => {
 }
 
 .btn-view,
+.btn-playwright,
 .btn-export,
 .btn-delete {
   padding: 6px 12px;
@@ -724,6 +764,11 @@ onMounted(async () => {
   color: white;
 }
 
+.btn-playwright {
+  background: #8b5cf6;
+  color: white;
+}
+
 .btn-export {
   background: #f59e0b;
   color: white;
@@ -735,6 +780,7 @@ onMounted(async () => {
 }
 
 .btn-view:hover,
+.btn-playwright:hover,
 .btn-export:hover,
 .btn-delete:hover {
   opacity: 0.8;

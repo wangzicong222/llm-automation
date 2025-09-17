@@ -70,6 +70,24 @@ function extractName(text) {
   return m2 ? m2[0] : undefined;
 }
 
+// 从中文句子通用地提取“目标短语”（未加引号也可）
+function extractClickableText(text) {
+  if (!text) return undefined;
+  const t = text.replace(/\s+/g, '');
+  // 形如：点击xxx(按钮/链接/选项...)
+  const m1 = t.match(/(点击|单击)(.+?)(按钮|菜单|链接|选项|tab|页签)?/);
+  if (m1 && m1[2]) {
+    const val = m1[2]
+      .replace(/页面|上|中|里|弹窗|对话框|中的|里的/g, '')
+      .trim();
+    if (val && val.length <= 8) return val; // 按钮文本通常不长
+  }
+  // 形如：点击“新建押金” / 单击【确定】
+  const m2 = text.match(/[“【\[]([^”】\]]+)[”】\]]/);
+  if (m2 && m2[1]) return m2[1].trim();
+  return undefined;
+}
+
 function extractLabelFromSentence(text) {
   if (!text) return undefined;
   const t = text.replace(/\s+/g, '');
@@ -79,7 +97,89 @@ function extractLabelFromSentence(text) {
   // 形如：输入“xxx”到押金名称/填写“xxx”至押金名称
   const m2 = t.match(/(输入|填写)[“"'].*?[”"'].*?(到|至)(.+?)(中|里)?$/);
   if (m2 && m2[3]) return m2[3];
+  // 通用“名词+输入(框|栏|域)”
+  const m3 = t.match(/([^，。；,.]+?)(输入框|文本域|输入栏|输入区)/);
+  if (m3 && m3[1]) return m3[1];
   return undefined;
+}
+
+// 提取输入值：更鲁棒，适配多种中文标点和描述
+function extractInputValue(text) {
+  if (!text) return '';
+  // 1) 优先取引号内
+  const q = text.match(/(输入|填写)[^\n]*?[“"']([^”"']+)[”"']/);
+  if (q && q[2]) return q[2].trim();
+  // 2) 取“输入/填写”之后到句末（允许逗号、顿号等中文标点）
+  const m = text.match(/(输入|填写)[:：\s]*([\s\S]+?)(?:到|至|$|。|；|;)/);
+  if (m && m[2]) return m[2]
+    .replace(/^[\s\u3000]+/, '')
+    .replace(/^(到|至)/, '')
+    .replace(/^(在|于)?(.*?)(中|里)?$/, (s) => s)
+    .replace(/^(框中|文本框中|输入框中|到|至|:|：)+/g, '')
+    .trim();
+  return '';
+}
+
+// 通用地提取“选择/勾选”的目标文本（选项名）
+function extractOptionText(text) {
+  if (!text) return undefined;
+  const m1 = text.match(/(选择|勾选|切换|点击).*?[“"']([^”"']+)[”"']/);
+  if (m1 && m1[2]) return m1[2];
+  const m2 = text.replace(/\s+/g, '').match(/(选择|勾选|切换)(.+?)(选项|按钮|单选|复选)?/);
+  if (m2 && m2[2]) return m2[2];
+  return undefined;
+}
+
+// 从某个定位点向近邻查找可编辑输入（排除 radio/checkbox/hidden）
+async function nearestEditableInput(from) {
+  const candidates = [
+    from.locator('input:not([type="hidden"]):not([type="radio"]):not([type="checkbox"]), textarea').first(),
+    from.locator('..').locator('input:not([type="hidden"]):not([type="radio"]):not([type="checkbox"]), textarea').first(),
+    from.locator('..').locator('..').locator('input:not([type="hidden"]):not([type="radio"]):not([type="checkbox"]), textarea').first(),
+  ];
+  for (const c of candidates) {
+    try { await c.waitFor({ state: 'visible', timeout: 300 }); return c; } catch {}
+  }
+  return from; // 兜底返回原始节点（调用方需再作判断）
+}
+
+// 在弹窗内优先，通用选择“选项文本”。支持 radio/checkbox/select 下拉
+async function chooseOptionByText(page, optionText) {
+  if (!optionText) return false;
+  // 1) radio/checkbox label
+  const containers = [
+    '.ant-modal-content .ant-radio-group',
+    '.ant-modal-content .ant-checkbox-group',
+    '.ant-radio-group',
+    '.ant-checkbox-group'
+  ];
+  for (const sel of containers) {
+    try {
+      const c = page.locator(sel).first();
+      if (await c.isVisible({ timeout: 200 }).catch(() => false)) {
+        const target = c.getByText(optionText, { exact: false }).first();
+        await target.click({ timeout: 500 });
+        return true;
+      }
+    } catch {}
+  }
+  // 2) 尝试打开下拉并从面板选择
+  try {
+    // 先点击任何可作为选择触发的控件（在弹窗内优先）
+    const trigger = page.locator('.ant-modal-content [role="combobox"], .ant-modal-content .ant-select-selector, [role="combobox"], .ant-select-selector').first();
+    if (await trigger.isVisible({ timeout: 200 }).catch(() => false)) {
+      await trigger.click();
+    }
+    const opt = page.locator('.ant-select-dropdown').getByText(optionText, { exact: false }).first();
+    await opt.click({ timeout: 800 });
+    return true;
+  } catch {}
+  // 3) 兜底：直接点击包含该文本的元素
+  try {
+    await page.getByText(optionText, { exact: false }).first().click({ timeout: 500 });
+    return true;
+  } catch {}
+  return false;
 }
 
 async function resolveLocator(page, action) {
@@ -91,18 +191,69 @@ async function resolveLocator(page, action) {
     if (name) candidates.push(page.getByPlaceholder(name));
     const label = extractLabelFromSentence(action.raw);
     if (label) {
+      // 优先尝试 textarea（用于释义/备注类长文本）
       candidates.push(
         page
           .locator('.ant-modal-content .ant-form-item:has(label:has-text("' + label + '"))')
-          .locator('input:not([type="hidden"]), textarea')
+          .locator('textarea, input:not([type="hidden"])')
           .first()
       );
       candidates.push(
         page
           .locator('.ant-form-item:has(label:has-text("' + label + '"))')
+          .locator('textarea, input:not([type="hidden"])')
+          .first()
+      );
+      // 邻近文本 → 父级 → 可编辑输入
+      candidates.push(
+        page.getByText(label, { exact: false })
+          .locator('..')
           .locator('input:not([type="hidden"]), textarea')
           .first()
       );
+      // placeholder/aria-label 包含 label
+      candidates.push(page.locator(`input[placeholder*="${label}"]`).first());
+      candidates.push(page.locator(`[aria-label*="${label}"]`).first());
+    }
+    // 若句子包含“对应/相关/本项”，优先在已选中的单选/复选附近寻找输入框（通用“跟随上一步选择的项”）
+    if (/对应|相关|本项/.test(action.raw)) {
+      try {
+        const checked = page.locator('.ant-modal-content .ant-radio-wrapper-checked, .ant-modal-content [aria-checked="true"], .ant-modal-content input[type="radio"]:checked, .ant-modal-content input[type="checkbox"]:checked').first();
+        await checked.waitFor({ state: 'visible', timeout: 300 });
+        const near = await nearestEditableInput(checked);
+        candidates.push(near);
+      } catch {}
+    }
+    // 若文本语义或长度像“释义/描述/备注/说明/多行”，优先选择 textarea
+    const looksLikeTextarea = /(文本域|多行|释义|描述|备注|说明)/.test(action.raw);
+    if (looksLikeTextarea) {
+      candidates.push(page.locator('.ant-modal-content textarea').first());
+    }
+    // 弹窗内首个空白输入作为兜底
+    candidates.push(page.locator('.ant-modal-content input:not([type="hidden"]):not([disabled])').first());
+    candidates.push(page.locator('.ant-modal-content textarea').first());
+  }
+  if (action.verb === 'click') {
+    const btnText = extractClickableText(action.raw);
+    if (btnText) {
+      // 优先在弹窗内找，再全局找
+      const spacedInsensitive = new RegExp(btnText.split('').map(ch => /[\w\u4e00-\u9fa5]/.test(ch) ? `${ch}\\s*` : ch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join(''));
+      candidates.push(page.locator('.ant-modal-content').getByRole('button', { name: btnText }));
+      candidates.push(page.getByRole('button', { name: btnText }));
+      // 名称中可能包含空格（如“确 定”），用空格不敏感匹配
+      candidates.push(page.locator('.ant-modal-content').getByRole('button', { name: spacedInsensitive }));
+      candidates.push(page.getByRole('button', { name: spacedInsensitive }));
+      candidates.push(page.getByText(btnText));
+      candidates.push(page.getByText(spacedInsensitive));
+      // 弹窗页脚主按钮兜底
+      candidates.push(page.locator('.ant-modal-content .ant-modal-footer .ant-btn-primary').first());
+    }
+    // 通用选项文本（单选/多选/下拉）
+    const optText = extractOptionText(action.raw) || btnText;
+    if (optText) {
+      candidates.push(page.locator('.ant-modal-content .ant-radio-group, .ant-modal-content .ant-checkbox-group').getByText(optText, { exact: false }));
+      candidates.push(page.locator('.ant-radio-group, .ant-checkbox-group').getByText(optText, { exact: false }));
+      candidates.push(page.locator('.ant-select-dropdown').getByText(optText, { exact: false }));
     }
   }
   if (name) candidates.push(page.getByRole('button', { name }));
@@ -123,19 +274,49 @@ async function runAction(page, action) {
   const locator = await resolveLocator(page, action);
   switch (action.verb) {
     case 'click':
-      await locator.click();
+      await locator.first().click();
       return;
     case 'fill': {
-      // 优先解析“输入/填写"xxx"”中的值
-      let value = (action.raw.match(/(输入|填写)[“"'](.+?)[”"']/) || [])[2] || '';
-      if (!value) value = (action.raw.match(/输入(.+?)(?:。|，|,|$)/) || [])[1] || '';
-      await locator.fill(value.replace(/^“|”|"/g, '').trim());
+      // 解析值（去除“框中”“：”等噪声）
+      const value = extractInputValue(action.raw);
+      const target = locator.first();
+      // 数值型优先选择具备 number/decimal 能力的输入
+      if (/^[-+]?\d+(\.\d+)?$/.test(value)) {
+        // 先在被选中单选项附近找数字输入，再回退 target
+        try {
+          const checked = page.locator('.ant-modal-content .ant-radio-wrapper-checked, .ant-modal-content [aria-checked="true"], .ant-modal-content input[type="radio"]:checked').first();
+          const near = await nearestEditableInput(checked);
+          const numericNear = near.locator('input[type=number], input[inputmode=decimal], input[role=spinbutton]').first();
+          await numericNear.waitFor({ state: 'visible', timeout: 300 });
+          await numericNear.fill(value);
+          return;
+        } catch {}
+        const numeric = target.locator('input[type=number], input[inputmode=decimal], input[role=spinbutton]').first();
+        try { await numeric.waitFor({ state: 'visible', timeout: 300 }); await numeric.fill(value); return; } catch {}
+      }
+      // 若目标是只读的 span/input（某些 UI 采用只读外壳 + 内部真实 input），尝试向内层 input 回退
+      // 若目标是 textarea 则直接填；若是 input 则直接填；否则回退到内部第一个 input/textarea
+      try {
+        const role = await target.evaluate(el => (el instanceof HTMLTextAreaElement) ? 'textarea' : (el instanceof HTMLInputElement ? 'input' : 'other')).catch(() => 'other');
+        if (role === 'textarea' || role === 'input') {
+          await target.fill(value);
+        } else {
+          const inner = target.locator('textarea, input').first();
+          await inner.waitFor({ state: 'visible', timeout: 200 });
+          await inner.fill(value);
+        }
+      } catch (e) { throw e; }
       return;
     }
     case 'select':
-      // 简化：尝试点击选项文本
-      const name = extractName(action.raw);
-      if (name) await page.getByText(name).first().click();
+      // 通用：优先使用选项文本通道
+      {
+        const opt = extractOptionText(action.raw) || extractName(action.raw);
+        const ok = await chooseOptionByText(page, opt);
+        if (!ok && opt) {
+          await page.getByText(opt).first().click();
+        }
+      }
       return;
     case 'check':
       await locator.check({ force: true }).catch(async () => locator.click());
@@ -151,6 +332,68 @@ async function runAction(page, action) {
     }
     default:
       return; // 断言留给断言阶段
+  }
+}
+
+async function runActionWithMcpFallback(page, action, opts = {}) {
+  const { onEvent, metrics, execMode = (process.env.DIRECT_EXEC_MODE || 'rule-first'), mcpLimits = {} } = opts || {};
+  const mcpEnabled = process.env.MCP_ENABLED === 'true';
+  const maxCallsPerCase = Number(mcpLimits.maxCallsPerCase ?? (process.env.MCP_MAX_CALLS_PER_CASE || 5));
+  try {
+    if (execMode !== 'mcp-only') {
+      await runAction(page, action);
+      return true;
+    }
+  } catch (err) {
+    if (!mcpEnabled && execMode !== 'mcp-only') throw err;
+    if (metrics) {
+      metrics.mcpTriggered = (metrics.mcpTriggered || 0) + 1;
+      metrics.ruleFailures = (metrics.ruleFailures || 0) + 1;
+    }
+    if (typeof onEvent === 'function') onEvent('log', { level: 'warn', text: `规则执行失败或跳过规则，尝试MCP：${err?.message || ''}`, ts: Date.now() });
+    // 采集上下文
+    const html = await page.content().catch(() => '');
+    let screenshotDataUrl = '';
+    try {
+      const buf = await page.screenshot({ fullPage: true });
+      screenshotDataUrl = `data:image/png;base64,${buf.toString('base64')}`;
+    } catch {}
+    const { callMcpSuggest } = require('./mcp-client');
+    const { actions } = await callMcpSuggest({
+      endpoint: process.env.MCP_ENDPOINT,
+      apiKey: process.env.MCP_API_KEY,
+      model: process.env.MCP_MODEL,
+      stepText: action.raw,
+      html,
+      url: page.url(),
+      lastError: err?.message,
+      screenshotDataUrl
+    });
+    // 安全白名单
+    const allowedVerbs = new Set(['click', 'fill', 'select', 'check']);
+    for (const a of actions || []) {
+      try {
+        if (!allowedVerbs.has(a.verb)) continue;
+        if (a.verb === 'click') await page.locator(a.selector).first().click();
+        else if (a.verb === 'fill') await page.locator(a.selector).first().fill(a.value || '');
+        else if (a.verb === 'select') await page.locator(a.selector).first().click();
+        else if (a.verb === 'check') await page.locator(a.selector).first().check({ force: true });
+        if (metrics) metrics.mcpSuccess = (metrics.mcpSuccess || 0) + 1;
+        if (typeof onEvent === 'function') onEvent('log', { level: 'info', text: 'MCP 兜底执行成功', ts: Date.now() });
+        // 简易缓存（内存）：按 URL 路径 + 步骤文本
+        try {
+          const key = `${new URL(page.url()).pathname}|${(action.raw || '').trim()}`;
+          const list = (global.__selectorCache = global.__selectorCache || new Map());
+          const arr = list.get(key) || [];
+          arr.unshift({ verb: a.verb, selector: a.selector, value: a.value });
+          list.set(key, arr.slice(0, 3));
+        } catch {}
+        return true;
+      } catch (e) {
+        if (typeof onEvent === 'function') onEvent('log', { level: 'warn', text: `MCP 指令失败：${e.message}`, ts: Date.now() });
+      }
+    }
+    throw err;
   }
 }
 
@@ -203,9 +446,17 @@ class DirectExecutor {
     return false;
   }
 
-  async executeCases({ cases = [], pageUrl, browser = 'chromium', headless = true, timeout = 30000, retries = 0, storageState, onEvent }) {
+  async executeCases({ cases = [], pageUrl, browser = 'chromium', headless = true, timeout = 30000, retries = 0, storageState, onEvent, visualMode = false, debugMode = false, execMode = (process.env.DIRECT_EXEC_MODE || 'rule-first'), mcpLimits = {} }) {
     const browserType = pickBrowser(browser);
-    const launch = await browserType.launch({ headless });
+    
+    // 可视化模式配置
+    const launchOptions = { 
+      headless: headless && !visualMode && !debugMode,
+      slowMo: debugMode ? 1000 : 0, // 调试模式添加延迟
+      devtools: debugMode // 调试模式打开开发者工具
+    };
+    
+    const launch = await browserType.launch(launchOptions);
     const results = [];
 
     try {
@@ -216,7 +467,7 @@ class DirectExecutor {
         const framesDir = path.join(caseDir, 'frames');
         ensureDirSync(framesDir);
 
-        const summary = { id: testCase.id, title: testCase.title, success: true, steps: [], startedAt: nowIso(), screenshots: [], video: undefined };
+        const summary = { id: testCase.id, title: testCase.title, success: true, steps: [], startedAt: nowIso(), screenshots: [], video: undefined, metrics: {} };
 
         const context = await launch.newContext({
           ...(storageState ? { storageState } : {}),
@@ -233,25 +484,7 @@ class DirectExecutor {
           if (typeof onEvent === 'function') onEvent('log', { level: 'error', text: err.message, ts: Date.now(), caseId: testCase.id, title: testCase.title });
         });
         try {
-          // 1) 若配置了登录入口，优先走登录域，确保单点登录态就绪
-          const loginUrl = process.env.LOGIN_URL;
-          if (loginUrl) {
-            try {
-              await page.goto(loginUrl);
-              await page.waitForLoadState('networkidle');
-              // 检测是否停留在登录页，若是则尝试自动登录
-              const looksLikeLogin = await this.#looksLikeLoginPage(page);
-              if (looksLikeLogin) {
-                if (typeof onEvent === 'function') onEvent('log', { level: 'info', text: '检测到登录页，尝试自动登录…', ts: Date.now(), caseId: testCase.id, title: testCase.title });
-                await this.#performAutoLogin(page, onEvent, testCase);
-                await page.waitForLoadState('networkidle');
-              }
-            } catch (e) {
-              if (typeof onEvent === 'function') onEvent('log', { level: 'warn', text: `预登录流程出现问题：${e.message}` , ts: Date.now(), caseId: testCase.id, title: testCase.title });
-            }
-          }
-
-          // 2) 进入目标业务页面
+          // 1) 直接访问目标页面
           if (pageUrl) {
             // 若目标域为财务域，且当前仍在登录/门户域，优先尝试从门户点击跳转，确保 SSO 初始化
             try {
@@ -274,16 +507,17 @@ class DirectExecutor {
             await page.goto(pageUrl);
             await page.waitForLoadState('networkidle');
 
-            // 若直接落到业务页却仍出现登录态缺失，二次尝试登录
-            const stillLogin = await this.#looksLikeLoginPage(page);
-            if (stillLogin) {
+            // 检测目标页面是否需要登录
+            const needsLogin = await this.#looksLikeLoginPage(page);
+            if (needsLogin) {
               try {
-                if (typeof onEvent === 'function') onEvent('log', { level: 'info', text: '业务页检测到未登录，二次自动登录…', ts: Date.now(), caseId: testCase.id, title: testCase.title });
+                if (typeof onEvent === 'function') onEvent('log', { level: 'info', text: '目标页面需要登录，尝试自动登录…', ts: Date.now(), caseId: testCase.id, title: testCase.title });
                 await this.#performAutoLogin(page, onEvent, testCase);
+                // 登录后重新访问目标页面
                 await page.goto(pageUrl);
                 await page.waitForLoadState('networkidle');
               } catch (e) {
-                if (typeof onEvent === 'function') onEvent('log', { level: 'error', text: `二次登录失败：${e.message}`, ts: Date.now(), caseId: testCase.id, title: testCase.title });
+                if (typeof onEvent === 'function') onEvent('log', { level: 'error', text: `自动登录失败：${e.message}`, ts: Date.now(), caseId: testCase.id, title: testCase.title });
                 summary.success = false;
               }
             }
@@ -298,12 +532,47 @@ class DirectExecutor {
           for (let i = 0; i < lines.length; i++) {
             const raw = lines[i];
             const action = inferActionFromText(raw);
+            
+            // 调试模式：发送步骤信息并等待用户确认
+            if (debugMode && typeof onEvent === 'function') {
+              onEvent('log', { 
+                level: 'info', 
+                text: `🔍 调试模式 - 步骤 ${i+1}/${lines.length}: ${raw}`, 
+                ts: Date.now(), 
+                caseId: testCase.id, 
+                title: testCase.title 
+              });
+              onEvent('debug-step', { 
+                stepIndex: i+1, 
+                totalSteps: lines.length, 
+                stepText: raw, 
+                action: action.verb,
+                ts: Date.now(),
+                caseId: testCase.id,
+                title: testCase.title
+              });
+              
+              // 在调试模式下，等待用户确认继续
+              await new Promise(resolve => setTimeout(resolve, 2000)); // 给用户2秒时间观察
+            }
+            
             let attempt = 0;
             let ok = false;
             while (attempt <= retries && !ok) {
               try {
-                await runAction(page, action);
+                await runActionWithMcpFallback(page, action, { onEvent, metrics: summary.metrics, execMode, mcpLimits });
                 ok = true;
+                
+                // 调试模式：执行成功后也发送确认
+                if (debugMode && typeof onEvent === 'function') {
+                  onEvent('log', { 
+                    level: 'success', 
+                    text: `✅ 步骤 ${i+1} 执行成功: ${raw}`, 
+                    ts: Date.now(), 
+                    caseId: testCase.id, 
+                    title: testCase.title 
+                  });
+                }
               } catch (e) {
                 attempt++;
                 if (attempt > retries) {
@@ -312,6 +581,17 @@ class DirectExecutor {
                   await page.screenshot({ path: p, fullPage: true }).catch(() => {});
                   summary.screenshots.push(p);
                   summary.steps.push({ index: i+1, action: action.verb, raw, success: false, error: e.message });
+                  
+                  // 调试模式：失败时也发送详细信息
+                  if (debugMode && typeof onEvent === 'function') {
+                    onEvent('log', { 
+                      level: 'error', 
+                      text: `❌ 步骤 ${i+1} 执行失败: ${e.message}`, 
+                      ts: Date.now(), 
+                      caseId: testCase.id, 
+                      title: testCase.title 
+                    });
+                  }
                 }
               }
             }
