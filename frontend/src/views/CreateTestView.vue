@@ -319,13 +319,47 @@
           >
             一键生成自动化代码
           </button>
+          
+          <!-- 执行模式选择器 -->
+          <div class="execution-mode-selector" style="margin-left: 12px; display: inline-flex; align-items: center; gap: 8px;">
+            <label style="font-size: 14px; color: #374151;">执行模式：</label>
+            <select 
+              v-model="executionMode" 
+              :disabled="directRunning"
+              style="padding: 4px 8px; border: 1px solid #d1d5db; border-radius: 4px; font-size: 14px;"
+            >
+              <option value="headless">无头模式（后台运行）</option>
+              <option value="visual">可视化模式（调起浏览器）</option>
+              <option value="debug">调试模式（逐步执行）</option>
+            </select>
+          </div>
+
+          <!-- MCP 策略配置 -->
+          <div style="margin-left: 12px; display: inline-flex; align-items: center; gap: 6px;">
+            <label style="font-size: 14px; color: #374151;">MCP 模式：</label>
+            <select v-model="mcpExecMode" :disabled="directRunning" style="padding: 4px 8px; border: 1px solid #d1d5db; border-radius: 4px; font-size: 14px;">
+              <option value="rule-first">规则优先</option>
+              <option value="mcp-only">仅 MCP</option>
+              <option value="rule-only">仅规则</option>
+            </select>
+            <label style="font-size: 14px; color: #374151;">MCP 步骤上限：</label>
+            <input v-model="mcpMaxCalls" type="number" min="0" step="1" :disabled="directRunning" style="width:80px; padding: 4px 6px; border: 1px solid #d1d5db; border-radius: 4px; font-size: 14px;" />
+          </div>
+          
           <button 
             @click="executeDirect" 
             class="generate-btn"
             :disabled="!canGenerate || directRunning"
-            style="margin-left:8px;background:#059669;"
+            :style="{
+              marginLeft: '8px',
+              background: executionMode === 'visual' ? '#dc2626' : executionMode === 'debug' ? '#7c3aed' : '#059669'
+            }"
           >
-            直接执行（不生成代码）
+            {{ 
+              executionMode === 'visual' ? '🎯 可视化执行' : 
+              executionMode === 'debug' ? '🔍 调试执行' : 
+              '直接执行（不生成代码）' 
+            }}
           </button>
         </div>
       </div>
@@ -419,22 +453,22 @@
               
               <!-- 兜底显示：如果没有分组数据，显示原始格式 -->
               <div v-else class="fallback-rules">
-                <h4>步骤规则</h4>
-                <ul class="rule-list">
-                  <li v-for="(r, idx) in ruleSummary.steps" :key="'s-'+idx" :class="r.hit ? 'hit' : 'miss'">
-                    <span class="badge" :class="r.hit ? 'done' : 'running'">{{ r.hit ? '命中' : '未命中' }}</span>
-                    <span class="text">{{ r.text }}</span>
-                    <span class="rule">{{ r.rule }}</span>
-                  </li>
-                </ul>
-                <h4 style="margin-top:12px;">预期规则</h4>
-                <ul class="rule-list">
-                  <li v-for="(r, idx) in ruleSummary.expects" :key="'e-'+idx" :class="r.hit ? 'hit' : 'miss'">
-                    <span class="badge" :class="r.hit ? 'done' : 'running'">{{ r.hit ? '命中' : '未命中' }}</span>
-                    <span class="text">{{ r.text }}</span>
-                    <span class="rule">{{ r.rule }}</span>
-                  </li>
-                </ul>
+              <h4>步骤规则</h4>
+              <ul class="rule-list">
+                <li v-for="(r, idx) in ruleSummary.steps" :key="'s-'+idx" :class="r.hit ? 'hit' : 'miss'">
+                  <span class="badge" :class="r.hit ? 'done' : 'running'">{{ r.hit ? '命中' : '未命中' }}</span>
+                  <span class="text">{{ r.text }}</span>
+                  <span class="rule">{{ r.rule }}</span>
+                </li>
+              </ul>
+              <h4 style="margin-top:12px;">预期规则</h4>
+              <ul class="rule-list">
+                <li v-for="(r, idx) in ruleSummary.expects" :key="'e-'+idx" :class="r.hit ? 'hit' : 'miss'">
+                  <span class="badge" :class="r.hit ? 'done' : 'running'">{{ r.hit ? '命中' : '未命中' }}</span>
+                  <span class="text">{{ r.text }}</span>
+                  <span class="rule">{{ r.rule }}</span>
+                </li>
+              </ul>
               </div>
               
               <!-- 提Bug按钮 -->
@@ -1042,6 +1076,15 @@ async function generateTestCode() {
   }
 }
 
+// 执行模式状态
+const executionMode = ref('headless') // 'headless' | 'visual' | 'debug'
+const isVisualMode = computed(() => executionMode.value === 'visual')
+const isDebugMode = computed(() => executionMode.value === 'debug')
+
+// MCP 执行策略（规则优先/仅MCP/仅规则）与预算
+const mcpExecMode = ref('rule-first')
+const mcpMaxCalls = ref(5)
+
 // 直接执行：不生成代码，按所选 TAPD 用例直接驱动浏览器
 async function executeDirect() {
   try {
@@ -1066,13 +1109,24 @@ async function executeDirect() {
       steps: (tc.steps || []).map(s => ({ step: s.step, action: s.action, expected: s.expected }))
     }))
 
+    // 根据执行模式设置不同的选项 + MCP 设置
+    const options = {
+      browser: 'chromium', 
+      headless: executionMode.value === 'headless',
+      retries: 0,
+      visualMode: executionMode.value === 'visual',
+      debugMode: executionMode.value === 'debug',
+      execMode: mcpExecMode.value, // 'rule-first' | 'mcp-only' | 'rule-only'
+      mcpLimits: { maxCallsPerCase: Number(mcpMaxCalls.value || 5) }
+    }
+
     const resp = await fetch('http://localhost:3002/api/direct-exec-stream', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         tapdSelected: slimSelected,
         tapdPageInfo: tapdPageInfo.value,
-        options: { browser: 'chromium', headless: true, retries: 0 }
+        options
       })
     })
     if (!resp.ok || !resp.body) throw new Error('执行接口不可用')
@@ -1092,7 +1146,10 @@ async function executeDirect() {
         let data: any = {}
         try { data = JSON.parse(dataLine) } catch {}
         if (ev === 'start') {
-          stepsList.value = [...stepsList.value, `开始直接执行：共 ${data.total || 0} 条用例`]
+          const modeText = executionMode.value === 'visual' ? '（可视化模式 - 浏览器窗口已打开）' : 
+                          executionMode.value === 'debug' ? '（调试模式 - 逐步执行）' : 
+                          '（无头模式 - 后台运行）'
+          stepsList.value = [...stepsList.value, `开始直接执行：共 ${data.total || 0} 条用例 ${modeText}`]
           aiTab.value = 'preview'
         } else if (ev === 'case') {
           const title = data.title || data.id || '未命名用例'
@@ -1104,6 +1161,11 @@ async function executeDirect() {
           if (data && data.url) latestVideo.value = `http://localhost:3002${data.url}`
         } else if (ev === 'log') {
           if (data && data.text) liveLogs.value = [...liveLogs.value, { level: data.level || 'log', text: data.text }]
+        } else if (ev === 'debug-step') {
+          // 调试模式：显示当前执行步骤
+          const stepInfo = `🔍 调试步骤 ${data.stepIndex}/${data.totalSteps}: ${data.stepText}`
+          stepsList.value = [...stepsList.value, stepInfo]
+          if (data && data.url) latestFrame.value = `http://localhost:3002${data.url}`
         } else if (ev === 'end') {
           stepsList.value = [...stepsList.value, '执行完成']
         } else if (ev === 'error') {
