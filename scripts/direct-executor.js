@@ -1,4 +1,5 @@
 const { chromium, firefox, webkit } = require('playwright');
+const fetch = require('node-fetch');
 const path = require('path');
 const fs = require('fs').promises;
 
@@ -236,11 +237,17 @@ async function resolveLocator(page, action) {
   if (action.verb === 'click') {
     const btnText = extractClickableText(action.raw);
     if (btnText) {
+      // 特殊处理：表格操作按钮（修改、编辑、删除、查看），避免点到导航栏
+      if (/^(修改|编辑|删除|查看)$/.test(btnText)) {
+        candidates.push(page.locator('.ant-table, table').locator('a, button').filter({ hasText: btnText }).first());
+        candidates.push(page.locator('.ant-table tbody tr, table tbody tr').locator('a, button').filter({ hasText: btnText }).first());
+      }
+      
       // 优先在弹窗内找，再全局找
       const spacedInsensitive = new RegExp(btnText.split('').map(ch => /[\w\u4e00-\u9fa5]/.test(ch) ? `${ch}\\s*` : ch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join(''));
       candidates.push(page.locator('.ant-modal-content').getByRole('button', { name: btnText }));
       candidates.push(page.getByRole('button', { name: btnText }));
-      // 名称中可能包含空格（如“确 定”），用空格不敏感匹配
+      // 名称中可能包含空格（如"确 定"），用空格不敏感匹配
       candidates.push(page.locator('.ant-modal-content').getByRole('button', { name: spacedInsensitive }));
       candidates.push(page.getByRole('button', { name: spacedInsensitive }));
       candidates.push(page.getByText(btnText));
@@ -358,43 +365,99 @@ async function runActionWithMcpFallback(page, action, opts = {}) {
       const buf = await page.screenshot({ fullPage: true });
       screenshotDataUrl = `data:image/png;base64,${buf.toString('base64')}`;
     } catch {}
-    const { callMcpSuggest } = require('./mcp-client');
-    const { actions } = await callMcpSuggest({
-      endpoint: process.env.MCP_ENDPOINT,
-      apiKey: process.env.MCP_API_KEY,
-      model: process.env.MCP_MODEL,
+    // 纯 MCP：使用 call-tools 循环
+    const ok = await mcpToolsLoop(page, {
       stepText: action.raw,
       html,
       url: page.url(),
-      lastError: err?.message,
-      screenshotDataUrl
+      screenshotDataUrl,
+      onEvent,
+      limits: { maxCalls: maxCallsPerCase }
     });
-    // 安全白名单
-    const allowedVerbs = new Set(['click', 'fill', 'select', 'check']);
-    for (const a of actions || []) {
-      try {
-        if (!allowedVerbs.has(a.verb)) continue;
-        if (a.verb === 'click') await page.locator(a.selector).first().click();
-        else if (a.verb === 'fill') await page.locator(a.selector).first().fill(a.value || '');
-        else if (a.verb === 'select') await page.locator(a.selector).first().click();
-        else if (a.verb === 'check') await page.locator(a.selector).first().check({ force: true });
-        if (metrics) metrics.mcpSuccess = (metrics.mcpSuccess || 0) + 1;
-        if (typeof onEvent === 'function') onEvent('log', { level: 'info', text: 'MCP 兜底执行成功', ts: Date.now() });
-        // 简易缓存（内存）：按 URL 路径 + 步骤文本
-        try {
-          const key = `${new URL(page.url()).pathname}|${(action.raw || '').trim()}`;
-          const list = (global.__selectorCache = global.__selectorCache || new Map());
-          const arr = list.get(key) || [];
-          arr.unshift({ verb: a.verb, selector: a.selector, value: a.value });
-          list.set(key, arr.slice(0, 3));
-        } catch {}
-        return true;
-      } catch (e) {
-        if (typeof onEvent === 'function') onEvent('log', { level: 'warn', text: `MCP 指令失败：${e.message}`, ts: Date.now() });
-      }
+    if (ok) {
+      if (metrics) metrics.mcpSuccess = (metrics.mcpSuccess || 0) + 1;
+      return true;
     }
     throw err;
   }
+}
+
+// MCP 工具循环：OpenAI tools 协议
+async function mcpToolsLoop(page, { stepText, html, url, screenshotDataUrl, onEvent, limits = {} }) {
+  const endpoint = process.env.MCP_ENDPOINT;
+  if (!endpoint) return false;
+  const model = process.env.MCP_MODEL || 'gpt-4o-mini';
+  const apiKey = process.env.MCP_API_KEY;
+  const maxCalls = Number(limits.maxCalls ?? 8);
+
+  const tools = [
+    { type: 'function', function: { name: 'goto', description: 'Navigate to url', parameters: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] } } },
+    { type: 'function', function: { name: 'click', description: 'Click element by CSS/XPath or byText with prefix text:', parameters: { type: 'object', properties: { selector: { type: 'string' } }, required: ['selector'] } } },
+    { type: 'function', function: { name: 'fill', description: 'Fill input/textarea by CSS/XPath/label selector', parameters: { type: 'object', properties: { selector: { type: 'string' }, value: { type: 'string' } }, required: ['selector','value'] } } },
+    { type: 'function', function: { name: 'selectOption', description: 'Select/click an option by visible text', parameters: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] } } },
+    { type: 'function', function: { name: 'waitFor', description: 'Wait for selector/state/ms', parameters: { type: 'object', properties: { selector: { type: 'string' }, state: { type: 'string' }, ms: { type: 'number' } } } } },
+    { type: 'function', function: { name: 'assertVisible', description: 'Assert text visible', parameters: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] } } },
+    { type: 'function', function: { name: 'done', description: 'Finish the step when completed', parameters: { type: 'object', properties: { ok: { type: 'boolean' } } } } }
+  ];
+
+  const sys = `你是前端页面自动化助手。你将通过工具一步步完成用户的自然语言步骤。必须优先在 .ant-modal-content 内定位弹窗元素，在表格操作中优先在 .ant-table 内查找“修改/编辑/删除/查看”。选择器尽量稳定：使用 role/name、label、placeholder，否则用稳健的 CSS/XPath。每次最多调用一个工具，直到完成后调用 done。`;
+
+  const messages = [
+    { role: 'system', content: sys },
+    { role: 'user', content: JSON.stringify({ stepText, url, htmlSnippet: (html || '').slice(0, 100000), screenshot: screenshotDataUrl }) }
+  ];
+
+  for (let callIndex = 0; callIndex < maxCalls; callIndex++) {
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}) },
+      body: JSON.stringify({ model, messages, tools, temperature: 0 })
+    }).catch(() => null);
+    if (!res || !res.ok) return false;
+    const data = await res.json().catch(() => ({}));
+    const choice = data?.choices?.[0];
+    const msg = choice?.message || {};
+    if (msg.tool_calls && msg.tool_calls.length) {
+      for (const tc of msg.tool_calls) {
+        const name = tc.function?.name;
+        let args = {};
+        try { args = JSON.parse(tc.function?.arguments || '{}'); } catch {}
+        if (typeof onEvent === 'function') onEvent('log', { level: 'info', text: `MCP调用 ${name}(${JSON.stringify(args)})`, ts: Date.now() });
+        let toolResult = '';
+        try {
+          if (name === 'goto' && args.url) { await page.goto(args.url); await page.waitForLoadState('networkidle'); toolResult = 'navigated'; }
+          else if (name === 'click' && args.selector) {
+            const sel = args.selector.startsWith('text:') ? page.getByText(args.selector.slice(5)) : page.locator(args.selector);
+            await sel.first().click(); toolResult = 'clicked';
+          } else if (name === 'fill' && args.selector) {
+            const target = args.selector.startsWith('label:') ? page.getByLabel(args.selector.slice(6)) : page.locator(args.selector);
+            await target.first().fill(String(args.value ?? '')); toolResult = 'filled';
+          } else if (name === 'selectOption' && args.text) {
+            await chooseOptionByText(page, args.text); toolResult = 'selected';
+          } else if (name === 'waitFor') {
+            if (args.selector) await page.locator(args.selector).first().waitFor({ state: args.state || 'visible', timeout: args.ms || 5000 });
+            else if (args.ms) await page.waitForTimeout(args.ms);
+            toolResult = 'waited';
+          } else if (name === 'assertVisible' && args.text) {
+            const { expect } = require('@playwright/test');
+            await expect(page.getByText(args.text, { exact: false })).toBeVisible(); toolResult = 'asserted';
+          } else if (name === 'done') {
+            return !!args.ok || true;
+          }
+        } catch (e) {
+          toolResult = `error: ${e.message}`;
+        }
+        messages.push({ role: 'tool', tool_call_id: tc.id, content: toolResult });
+      }
+      continue; // 继续下一轮
+    }
+    // 无工具调用则尝试自然语言完成判断
+    const content = msg.content || '';
+    if (/完成|已完成|done/i.test(content)) return true;
+    // 将模型回复纳入上下文，避免阻塞
+    messages.push({ role: 'assistant', content });
+  }
+  return false;
 }
 
 function inferExpectations(text) {

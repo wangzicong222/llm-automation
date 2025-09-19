@@ -48,6 +48,16 @@ export function inModal(page: Page, selector: string): Locator {
 }
 
 export async function typeByLabel(page: Page, labelText: string, value: string) {
+  // 若页面上没有弹窗，则自动回落到页面级输入（用于筛选查询区域）
+  try {
+    const hasModal = await page.locator('.ant-modal-content').first().isVisible().catch(async () => {
+      const cnt = await page.locator('.ant-modal-content').count().catch(() => 0);
+      return cnt > 0;
+    });
+    if (!hasModal) {
+      return await typeOnPageLabel(page, labelText, value);
+    }
+  } catch {}
   await waitModalVisible(page);
   // 1) 优先基于 AntD 结构的 label 文本匹配（移除无效的 :text() 伪类）
   let formItem = inModal(page, `.ant-form-item:has(label:has-text("${labelText}")), .ant-form-item:has(.ant-form-item-label :has-text("${labelText}"))`).first();
@@ -310,6 +320,89 @@ export async function assertModalClosedAndTable(page: Page) {
   await page.waitForLoadState('networkidle');
   await page.waitForSelector('.ant-table, table', { state: 'visible' });
   await expect(page.locator('.ant-table tbody tr, table tbody tr').first()).toBeVisible();
+}
+
+// 页面级：根据 label 或 placeholder 输入（不要求在弹窗内）
+export async function typeOnPageLabel(page: Page, labelText: string, value: string) {
+  // 优先：通过 label 关联的控件
+  let input = page.locator(`label:has-text("${labelText}")`).first()
+    .locator('xpath=following::*[self::input or self::textarea][1]');
+  if (!(await input.count())) {
+    // AntD 表单常见结构：.ant-form-item:has(label)
+    input = page.locator(`.ant-form-item:has(label:has-text("${labelText}")), .ant-form-item:has(.ant-form-item-label :has-text("${labelText}"))`)
+      .first().locator('input:not([type="hidden"]), textarea');
+  }
+  if (!(await input.count())) {
+    // placeholder 兜底
+    input = page.locator(`input[placeholder*="${labelText}"], textarea[placeholder*="${labelText}"], input[placeholder*="请输入"], textarea[placeholder*="请输入"]`).first();
+  }
+  // XPath 兜底
+  if (!(await input.count())) {
+    const safe = labelText.replace(/(["'])/g, '');
+    const xpath = `xpath=(//div[contains(@class,'ant-form-item')][.//*[contains(normalize-space(text()),'${safe}') or contains(normalize-space(text()),'${safe}：') or contains(normalize-space(text()),'${safe}:')]])[1]//input[not(@type='hidden')] | (//div[contains(@class,'ant-form-item')][.//*[contains(normalize-space(text()),'${safe}') or contains(normalize-space(text()),'${safe}：') or contains(normalize-space(text()),'${safe}:')]])[1]//textarea`;
+    input = page.locator(xpath).first();
+  }
+
+  await input.waitFor({ state: 'visible', timeout: 5000 }).catch(async () => {
+    await input.waitFor({ state: 'attached', timeout: 2000 }).catch(() => {});
+  });
+  await input.scrollIntoViewIfNeeded().catch(() => {});
+  try { await input.click({ force: true }); } catch {}
+  try { await input.fill(''); } catch {}
+  try { await input.type(value, { delay: 10 }); } catch { try { await input.fill(value); } catch {} }
+  // 验证与兜底
+  try {
+    let v = await input.inputValue();
+    if (!v || !v.includes(value)) {
+      await input.fill(value);
+      v = await input.inputValue();
+    }
+  } catch {}
+  return input;
+}
+
+
+// 在表格的某一行内点击指定的操作文本（如“修改/删除/查看”）
+// 选择策略：优先用 rowText 匹配含有该文本的行；否则按 index（默认第 1 行）
+export async function clickRowAction(page: Page, params: { rowText?: string, index?: number }, actionText: string = '修改') {
+  // 等待表格可见
+  await page.waitForSelector('.ant-table, table', { state: 'visible' });
+  const rows = page.locator('.ant-table tbody tr, table tbody tr');
+  await expect(rows.first()).toBeVisible();
+
+  // 选定目标行
+  let targetRow = rows.first();
+  if (params?.rowText) {
+    const byText = rows.filter({ hasText: params.rowText });
+    if (await byText.count()) targetRow = byText.first();
+  } else if (typeof params?.index === 'number' && params.index! > 0) {
+    const idx = Math.max(0, (params.index as number) - 1);
+    if ((await rows.count()) > idx) targetRow = rows.nth(idx);
+  }
+
+  // 在行内查找操作按钮/链接，容错空格
+  const actionRegex = new RegExp(actionText.split('').join('\\s*'));
+  let action = targetRow.locator('a, button, .ant-btn').filter({ hasText: actionRegex }).first();
+  if (!(await action.count())) {
+    // 兜底：试着在操作列内查找
+    const opCell = targetRow.locator('td:last-child');
+    action = opCell.locator('a, button, .ant-btn').filter({ hasText: actionRegex }).first();
+  }
+  if (!(await action.count())) {
+    // 再兜底：全表范围内相对最近的“修改”
+    action = page.locator('.ant-table a, .ant-table button, .ant-table .ant-btn').filter({ hasText: actionRegex }).first();
+  }
+  await action.scrollIntoViewIfNeeded().catch(() => {});
+  try {
+    await action.click();
+  } catch {
+    try { await action.click({ force: true }); } catch {}
+  }
+
+  // 若点击的是“修改”，通常会出现弹窗
+  if (/修\s*改/.test(actionText)) {
+    try { await waitModalVisible(page); } catch {}
+  }
 }
 
 
