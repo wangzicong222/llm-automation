@@ -327,9 +327,24 @@ function mapStepToCode(step, ruleSummary) {
     const name = cleanName(clickBtn[1] || clickBtn[0].replace(/^点击/, ''));
     ruleSummary.steps.push({ text: s, rule: 'click-button-by-name', hit: true });
     if (/^(确定|确认|保存|保 存)$/.test(name)) return `await clickOk(page);`;
+    
+      // 特殊处理：表格中的"修改"按钮，避免点到导航栏
+    if (/^(修改|编辑|删除|查看)$/.test(name)) {
+      return `await page.locator('.ant-table, table').locator('a, button').filter({ hasText: ${JSON.stringify(name)} }).first().click();`;
+    }
+    
     return `await page.getByRole('button', { name: ${JSON.stringify(name)} }).first().click();`;
   }
   
+  // 特殊处理：表格行操作按钮（如"点击第一行数据的修改按钮"）
+  const tableRowAction = s.match(/点击.*?第(\d+)?行.*?数据.*?的(.+?)按钮/) || s.match(/点击.*?第(\d+)?行.*?的(.+?)按钮/);
+  if (tableRowAction) {
+    const rowIndex = tableRowAction[1] ? parseInt(tableRowAction[1]) - 1 : 0; // 默认第一行
+    const actionName = cleanName(tableRowAction[2]);
+    ruleSummary.steps.push({ text: s, rule: 'click-table-row-action', hit: true });
+    return `await page.locator('.ant-table tbody tr, table tbody tr').nth(${rowIndex}).locator('a, button').filter({ hasText: ${JSON.stringify(actionName)} }).first().click();`;
+  }
+
   // 点击"确定/取消/X"
   if (/点击["']?确定["']?/.test(s)) { ruleSummary.steps.push({ text: s, rule: 'click-confirm', hit: true }); return `await page.getByRole('button', { name: /^(确定|确认|保 存|保存)$/ }).click();`; }
   if (/点击[""']?取消[""']?/.test(s)) { ruleSummary.steps.push({ text: s, rule: 'click-cancel', hit: true }); return `await page.getByRole('button', { name: '取消' }).click();`; }
@@ -531,6 +546,66 @@ function mapStepToCode(step, ruleSummary) {
     const fieldName = cleanName(inputInFieldWithComma[1]);
     const value = inputInFieldWithComma[2];
     ruleSummary.steps.push({ text: s, rule: 'fill-input-in-field-with-comma', hit: true });
+    const varName = `${fieldName.replace(/[\s"'，,。:：]/g, '')}Input`;
+    if (/金额/.test(fieldName)) {
+      return (
+        `const ${varName} = await typeAmount(page, ${JSON.stringify(value)});\n` +
+        `await assertValueContains(${varName}, ${JSON.stringify(value)});`
+      );
+    }
+    if (/释义/.test(fieldName)) {
+      return (
+        `const ${varName} = await typeTextarea(page, ${JSON.stringify(value)});\n` +
+        `await assertValueContains(${varName}, ${JSON.stringify(value)});`
+      );
+    }
+    return (
+      `const ${varName} = await typeByLabel(page, '${fieldName}', ${JSON.stringify(value)});\n` +
+      `await assertValueContains(${varName}, ${JSON.stringify(value)});\n` +
+      `if (!((await ${varName}.inputValue()).includes(${JSON.stringify(value)}))) {\n` +
+      `  await ${varName}.click({ force: true });\n` +
+      `  await ${varName}.type(${JSON.stringify(value)}, { delay: 10 });\n` +
+      `  await assertValueContains(${varName}, ${JSON.stringify(value)});\n` +
+      `}`
+    );
+  }
+
+  // 新增：处理"，押金名称输入框中客户预付款押金演示。"格式（以逗号开头，无"输入："）
+  const inputInFieldWithCommaNoColon = s.match(/^[，,、]\s*([^"']+?)输入框中([^"']+?)[。.]?$/);
+  if (inputInFieldWithCommaNoColon) {
+    const fieldName = cleanName(inputInFieldWithCommaNoColon[1]);
+    const value = inputInFieldWithCommaNoColon[2];
+    ruleSummary.steps.push({ text: s, rule: 'fill-input-in-field-with-comma-no-colon', hit: true });
+    const varName = `${fieldName.replace(/[\s"'，,。:：]/g, '')}Input`;
+    if (/金额/.test(fieldName)) {
+      return (
+        `const ${varName} = await typeAmount(page, ${JSON.stringify(value)});\n` +
+        `await assertValueContains(${varName}, ${JSON.stringify(value)});`
+      );
+    }
+    if (/释义/.test(fieldName)) {
+      return (
+        `const ${varName} = await typeTextarea(page, ${JSON.stringify(value)});\n` +
+        `await assertValueContains(${varName}, ${JSON.stringify(value)});`
+      );
+    }
+    return (
+      `const ${varName} = await typeByLabel(page, '${fieldName}', ${JSON.stringify(value)});\n` +
+      `await assertValueContains(${varName}, ${JSON.stringify(value)});\n` +
+      `if (!((await ${varName}.inputValue()).includes(${JSON.stringify(value)}))) {\n` +
+      `  await ${varName}.click({ force: true });\n` +
+      `  await ${varName}.type(${JSON.stringify(value)}, { delay: 10 });\n` +
+      `  await assertValueContains(${varName}, ${JSON.stringify(value)});\n` +
+      `}`
+    );
+  }
+
+  // 新增：处理"，押金释义输入框中演示用于保障客户提前支付款项的正常使用，金额为固定的1000元。"格式（包含逗号的复杂文本）
+  const inputInFieldWithCommaComplex = s.match(/^[，,、]\s*([^"']+?)输入框中([^"']+?)[。.]?$/);
+  if (inputInFieldWithCommaComplex && s.includes('，') && s.includes('用于')) {
+    const fieldName = cleanName(inputInFieldWithCommaComplex[1]);
+    const value = inputInFieldWithCommaComplex[2];
+    ruleSummary.steps.push({ text: s, rule: 'fill-input-in-field-with-comma-complex', hit: true });
     const varName = `${fieldName.replace(/[\s"'，,。:：]/g, '')}Input`;
     if (/金额/.test(fieldName)) {
       return (
